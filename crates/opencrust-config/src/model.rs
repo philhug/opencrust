@@ -370,6 +370,12 @@ pub struct McpServerConfig {
     /// Future: HTTP transport URL
     pub url: Option<String>,
 
+    /// Bearer token to send as `Authorization: Bearer …` on HTTP requests.
+    /// Ignored for stdio transport. Leave empty to look up the token from
+    /// the vault (`MCP_{SERVER}_AUTH_TOKEN`) or the env var of the same name.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+
     /// Whether this server is enabled (default: true)
     pub enabled: Option<bool>,
 

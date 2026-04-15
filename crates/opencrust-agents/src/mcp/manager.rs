@@ -57,6 +57,7 @@ enum ConnectionParams {
     },
     Http {
         url: String,
+        auth_token: Option<String>,
         timeout_secs: u64,
     },
 }
@@ -168,10 +169,21 @@ impl McpManager {
     }
 
     /// Connect to an MCP server via HTTP (Streamable HTTP transport).
-    pub async fn connect_http(&self, name: &str, url: &str, timeout_secs: u64) -> Result<()> {
+    pub async fn connect_http(
+        &self,
+        name: &str,
+        url: &str,
+        auth_token: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<()> {
         use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
-        let transport = StreamableHttpClientTransport::from_uri(url);
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+        if let Some(token) = auth_token {
+            config = config.auth_header(token);
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
 
         let service = tokio::time::timeout(Duration::from_secs(timeout_secs), ().serve(transport))
             .await
@@ -216,6 +228,7 @@ impl McpManager {
             instructions,
             params: ConnectionParams::Http {
                 url: url.to_string(),
+                auth_token: auth_token.map(str::to_string),
                 timeout_secs,
             },
         };
@@ -482,8 +495,12 @@ impl McpManager {
                 } => self.connect(&name, command, args, env, timeout_secs).await,
                 ConnectionParams::Http {
                     ref url,
+                    ref auth_token,
                     timeout_secs,
-                } => self.connect_http(&name, url, timeout_secs).await,
+                } => {
+                    self.connect_http(&name, url, auth_token.as_deref(), timeout_secs)
+                        .await
+                }
             };
 
             match result {

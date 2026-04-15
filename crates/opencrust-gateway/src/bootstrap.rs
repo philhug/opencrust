@@ -656,6 +656,28 @@ fn resolve_mcp_env(server_name: &str, env: &HashMap<String, String>) -> HashMap<
     resolved
 }
 
+/// Resolve the bearer token for an HTTP MCP server.
+///
+/// An empty string in config.yml triggers a lookup under
+/// `MCP_{SERVER}_AUTH_TOKEN` in the vault, then falling back to an env var
+/// of the same name. `None` disables auth. A literal value is passed through.
+fn resolve_mcp_auth_token(server_name: &str, configured: Option<&str>) -> Option<String> {
+    let configured = configured?;
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    let lookup_key = format!(
+        "MCP_{}_AUTH_TOKEN",
+        server_name.to_uppercase().replace('-', "_")
+    );
+    if let Some(vp) = default_vault_path()
+        && let Some(secret) = opencrust_security::try_vault_get(&vp, &lookup_key)
+    {
+        return Some(secret);
+    }
+    std::env::var(&lookup_key).ok()
+}
+
 /// Render a list of skill definitions into the `# Active Skills` prompt block.
 pub fn build_skill_block(skills: &[opencrust_skills::SkillDefinition]) -> String {
     let mut block = String::from("# Active Skills\n");
@@ -710,6 +732,7 @@ pub async fn build_mcp_tools(
         let timeout_secs = server_config.timeout.unwrap_or(30);
 
         let resolved_env = resolve_mcp_env(name, &server_config.env);
+        let resolved_auth_token = resolve_mcp_auth_token(name, server_config.auth_token.as_deref());
 
         let connect_result = match server_config.transport.as_str() {
             "stdio" => {
@@ -730,7 +753,9 @@ pub async fn build_mcp_tools(
                     );
                     continue;
                 };
-                manager.connect_http(name, url, timeout_secs).await
+                manager
+                    .connect_http(name, url, resolved_auth_token.as_deref(), timeout_secs)
+                    .await
             }
             other => {
                 warn!("MCP server '{name}' uses unsupported transport '{other}', skipping");

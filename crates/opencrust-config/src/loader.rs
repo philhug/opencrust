@@ -267,6 +267,7 @@ mod tests {
                 env: std::collections::HashMap::new(),
                 transport: "stdio".to_string(),
                 url: None,
+                auth_token: None,
                 enabled: None,
                 timeout: None,
             },

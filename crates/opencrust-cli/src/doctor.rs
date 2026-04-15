@@ -256,7 +256,10 @@ async fn check_mcp_servers(config: &AppConfig) -> Vec<(String, Check)> {
         let timeout_secs = server.timeout.unwrap_or(5).min(10);
         let check = match server.transport.as_str() {
             "http" => match &server.url {
-                Some(url) => match manager.connect_http(name, url, timeout_secs).await {
+                Some(url) => match manager
+                    .connect_http(name, url, server.auth_token.as_deref(), timeout_secs)
+                    .await
+                {
                     Ok(()) => {
                         let tools = manager.tool_info(name).await;
                         manager.disconnect(name).await;

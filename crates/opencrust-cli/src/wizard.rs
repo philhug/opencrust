@@ -2071,7 +2071,9 @@ pub async fn run_mcp_add_wizard(config_dir: &Path, pre_selected: Option<&str>) -
         let result = match mcp_config.transport.as_str() {
             "http" => {
                 if let Some(ref url) = mcp_config.url {
-                    manager.connect_http(&server_name, url, timeout).await
+                    manager
+                        .connect_http(&server_name, url, mcp_config.auth_token.as_deref(), timeout)
+                        .await
                 } else {
                     Err(opencrust_common::Error::Agent(
                         "HTTP transport but no url".into(),
@@ -2211,6 +2213,7 @@ async fn add_known_server(
         env,
         transport: server.transport.to_string(),
         url: None,
+        auth_token: None,
         enabled: Some(true),
         timeout: None,
     };
@@ -2326,6 +2329,7 @@ async fn add_custom_server(
         env,
         transport,
         url,
+        auth_token: None,
         enabled: Some(true),
         timeout: None,
     };

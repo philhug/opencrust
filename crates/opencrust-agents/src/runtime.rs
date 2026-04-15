@@ -683,9 +683,18 @@ impl AgentRuntime {
         self.tools.push(tool);
     }
 
-    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+    /// Tool definitions visible to the model for a given session. Filtered by
+    /// the session's `allowed_tools` when one is configured — sending 100+ MCP
+    /// schemas to a smaller model overwhelms its tool selection and surfaces as
+    /// malformed tool calls, so each session only sees what it can invoke.
+    fn tool_definitions_for_session(&self, session_id: &str) -> Vec<ToolDefinition> {
+        let allowed = self.session_allowed_tools(session_id);
         self.tools
             .iter()
+            .filter(|t| match allowed.as_ref() {
+                Some(list) => list.iter().any(|n| n == t.name()),
+                None => true,
+            })
             .map(|t| ToolDefinition {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -1095,7 +1104,7 @@ impl AgentRuntime {
             user_display.as_deref(),
         );
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = self.tool_definitions_for_session(session_id);
 
         let mut messages: Vec<ChatMessage> = conversation_history.to_vec();
         messages.push(ChatMessage {
@@ -1283,7 +1292,7 @@ impl AgentRuntime {
             user_display.as_deref(),
         );
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = self.tool_definitions_for_session(session_id);
 
         let mut messages: Vec<ChatMessage> = conversation_history.to_vec();
         messages.push(ChatMessage {
@@ -1482,7 +1491,7 @@ impl AgentRuntime {
             user_display.as_deref(),
         );
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = self.tool_definitions_for_session(session_id);
 
         let mut messages: Vec<ChatMessage> = conversation_history.to_vec();
         messages.push(ChatMessage {
@@ -1728,7 +1737,7 @@ impl AgentRuntime {
             user_display.as_deref(),
         );
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = self.tool_definitions_for_session(session_id);
 
         let mut messages: Vec<ChatMessage> = conversation_history.to_vec();
         messages.push(ChatMessage {
@@ -2084,7 +2093,7 @@ impl AgentRuntime {
             user_display.as_deref(),
         );
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = self.tool_definitions_for_session(session_id);
 
         let mut messages: Vec<ChatMessage> = conversation_history.to_vec();
         messages.push(ChatMessage {
@@ -2292,7 +2301,7 @@ impl AgentRuntime {
             user_display.as_deref(),
         );
 
-        let tool_defs = self.tool_definitions();
+        let tool_defs = self.tool_definitions_for_session(session_id);
 
         let mut messages: Vec<ChatMessage> = conversation_history.to_vec();
         messages.push(ChatMessage {

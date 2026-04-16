@@ -1387,6 +1387,7 @@ pub fn build_telegram_channels(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let channel_name = name.clone();
         let on_message: opencrust_channels::OnMessageFn = Arc::new(
             move |chat_id: i64,
                   user_id: String,
@@ -1407,6 +1408,7 @@ pub fn build_telegram_channels(
                 let stt_model = stt_model.clone();
                 let stt_api_key = stt_api_key.clone();
                 let data_dir = data_dir.clone();
+                let channel_name = channel_name.clone();
                 Box::pin(async move {
                     // --- Command handling (text-only) ---
                     if let Some(cmd) = text.strip_prefix('!').or_else(|| text.strip_prefix('/')) {
@@ -1498,9 +1500,19 @@ pub fn build_telegram_channels(
                     state
                         .check_token_budget(&session_id, &user_id, &guardrails_config)
                         .await?;
+                    let agent_tools =
+                        crate::agent_router::resolve(&state.config, None, Some(&channel_name))
+                            .and_then(|ac| {
+                                if ac.tools.is_empty() {
+                                    None
+                                } else {
+                                    Some(ac.tools.clone())
+                                }
+                            })
+                            .or_else(|| guardrails_config.allowed_tools.clone());
                     state.agents.set_session_tool_config(
                         &session_id,
-                        guardrails_config.allowed_tools.clone(),
+                        agent_tools,
                         guardrails_config.session_tool_call_budget,
                     );
                     if inject_user_name_tg {

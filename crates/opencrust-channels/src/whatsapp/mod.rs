@@ -55,6 +55,7 @@ pub struct WhatsAppChannel {
     access_token: String,
     phone_number_id: String,
     verify_token: String,
+    name: String,
     display: String,
     status: ChannelStatus,
     on_message: WhatsAppOnMessageFn,
@@ -72,10 +73,17 @@ impl WhatsAppChannel {
             access_token,
             phone_number_id,
             verify_token,
+            name: "whatsapp".to_string(),
             display: "WhatsApp".to_string(),
             status: ChannelStatus::Disconnected,
             on_message,
         }
+    }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     /// Access token for the WhatsApp Cloud API.
@@ -123,12 +131,17 @@ pub struct WhatsAppSender {
     client: Client,
     access_token: String,
     phone_number_id: String,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for WhatsAppSender {
     fn channel_type(&self) -> &str {
         "whatsapp"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -153,6 +166,7 @@ impl ChannelLifecycle for WhatsAppChannel {
             client: Client::new(),
             access_token: self.access_token.clone(),
             phone_number_id: self.phone_number_id.clone(),
+            name: self.name.clone(),
         })
     }
 
@@ -178,6 +192,10 @@ impl ChannelLifecycle for WhatsAppChannel {
 impl ChannelSender for WhatsAppChannel {
     fn channel_type(&self) -> &str {
         "whatsapp"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

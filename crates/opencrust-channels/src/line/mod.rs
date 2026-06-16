@@ -4,7 +4,8 @@ pub mod webhook;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
@@ -31,6 +32,19 @@ pub struct LineFile {
     /// MIME type string if detectable (e.g. `"application/pdf"`).
     pub mime_type: Option<String>,
 }
+
+/// Fire-and-forget callback invoked for every group text message (before reply filtering).
+/// Arguments: `(group_id, user_id, text)`.
+/// Used to embed and store messages for RAG without blocking the webhook response.
+pub type GroupObserveFn = Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Callback invoked when the bot receives a message from LINE.
 ///
@@ -60,13 +74,16 @@ pub struct LineChannel {
     /// Base URL for the LINE data API (file/image/audio downloads).
     /// Defaults to `https://api-data.line.me/v2/bot`.
     data_api_base_url: String,
+    name: String,
     display: String,
     /// LINE user ID of this bot, resolved from `GET /v2/bot/info` on connect.
-    /// Used to detect `@mention` in group messages.
-    bot_user_id: Option<String>,
+    /// `Arc<OnceLock>` lets a background retry task set it without exclusive ownership.
+    bot_user_id: Arc<OnceLock<String>>,
     status: ChannelStatus,
     on_message: LineOnMessageFn,
     group_filter: LineGroupFilter,
+    /// Optional RAG observer: called for every group text message before reply filtering.
+    group_observe_fn: Option<GroupObserveFn>,
 }
 
 impl LineChannel {
@@ -95,12 +112,30 @@ impl LineChannel {
             channel_secret,
             api_base_url: api::LINE_API_BASE.to_string(),
             data_api_base_url: api::LINE_DATA_API_BASE.to_string(),
+            name: "line".to_string(),
             display: String::new(),
-            bot_user_id: None,
+            bot_user_id: Arc::new(OnceLock::new()),
             status: ChannelStatus::Disconnected,
             on_message,
             group_filter,
+            group_observe_fn: None,
         }
+    }
+
+    /// Attach a RAG observer that embeds every group message for later retrieval.
+    pub fn with_group_observe(mut self, observe_fn: GroupObserveFn) -> Self {
+        self.group_observe_fn = Some(observe_fn);
+        self
+    }
+
+    pub fn group_observe_fn(&self) -> Option<&GroupObserveFn> {
+        self.group_observe_fn.as_ref()
+    }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     /// Override the LINE messaging API base URL (e.g. to point at a mock server in tests).
@@ -132,7 +167,7 @@ impl LineChannel {
     }
 
     pub fn bot_user_id(&self) -> Option<&str> {
-        self.bot_user_id.as_deref()
+        self.bot_user_id.get().map(String::as_str)
     }
 
     /// Verify the `X-Line-Signature` header.
@@ -174,12 +209,17 @@ pub struct LineSender {
     client: Client,
     channel_access_token: String,
     api_base_url: String,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for LineSender {
     fn channel_type(&self) -> &str {
         "line"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -204,6 +244,7 @@ impl ChannelLifecycle for LineChannel {
             client: self.client.clone(),
             channel_access_token: self.channel_access_token.clone(),
             api_base_url: self.api_base_url.clone(),
+            name: self.name.clone(),
         })
     }
 
@@ -218,10 +259,32 @@ impl ChannelLifecycle for LineChannel {
                     info.display_name, info.user_id
                 );
                 self.display = info.display_name;
-                self.bot_user_id = Some(info.user_id);
+                let _ = self.bot_user_id.set(info.user_id);
             }
             Err(e) => {
-                tracing::warn!("line: could not resolve bot info: {e}");
+                tracing::warn!("line: could not resolve bot info: {e} — retrying in background");
+                let bot_user_id = Arc::clone(&self.bot_user_id);
+                let client = self.client.clone();
+                let token = self.channel_access_token.clone();
+                let base_url = self.api_base_url.clone();
+                tokio::spawn(async move {
+                    for delay_secs in [0u64, 5, 15, 30, 60, 120] {
+                        if delay_secs > 0 {
+                            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        }
+                        match api::get_bot_info(&client, &token, &base_url).await {
+                            Ok(info) => {
+                                info!("line: bot_user_id resolved via retry: {}", info.user_id);
+                                let _ = bot_user_id.set(info.user_id);
+                                return;
+                            }
+                            Err(e) => tracing::warn!("line: bot info retry failed: {e}"),
+                        }
+                    }
+                    tracing::warn!(
+                        "line: could not resolve bot_user_id after all retries — @mention detection disabled"
+                    );
+                });
             }
         }
         self.status = ChannelStatus::Connected;
@@ -244,6 +307,10 @@ impl ChannelLifecycle for LineChannel {
 impl ChannelSender for LineChannel {
     fn channel_type(&self) -> &str {
         "line"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

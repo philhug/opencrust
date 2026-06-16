@@ -97,11 +97,149 @@ impl VectorStore {
             CREATE TABLE IF NOT EXISTS vec_id_map (
                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
                 entry_id TEXT NOT NULL UNIQUE
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS group_chat_messages (
+                id TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_group_chat_lookup ON group_chat_messages(channel, group_id);",
         )
         .map_err(|e| Error::Database(format!("vector store migration failed: {e}")))?;
 
         Ok(())
+    }
+
+    /// Insert a group chat message and its embedding into the store.
+    /// The embedding is stored in the shared vec0 table keyed by `id`.
+    pub fn insert_group_message(
+        &self,
+        channel: &str,
+        group_id: &str,
+        user_id: &str,
+        text: &str,
+        embedding: &[f32],
+        dimensions: usize,
+    ) -> Result<()> {
+        let id = format!("gchat:{channel}:{group_id}:{}", uuid::Uuid::new_v4());
+
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO group_chat_messages (id, channel, group_id, user_id, text) VALUES (?, ?, ?, ?, ?)",
+            params![id, channel, group_id, user_id, text],
+        )
+        .map_err(|e| Error::Database(format!("failed to insert group chat message: {e}")))?;
+        drop(conn);
+
+        self.ensure_vec_table(dimensions)?;
+        self.insert_embedding(&id, embedding, dimensions)?;
+        Ok(())
+    }
+
+    /// Search group chat messages by semantic similarity to `query_embedding`.
+    /// Returns `(user_id, text)` pairs for the given `channel` + `group_id`, ordered by relevance.
+    /// Falls back to recency-ordered keyword search when vec is unavailable or returns no results.
+    pub fn search_group_messages(
+        &self,
+        channel: &str,
+        group_id: &str,
+        query_embedding: &[f32],
+        dimensions: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let candidates = self.search_nearest(query_embedding, dimensions, limit * 10)?;
+        if candidates.is_empty() {
+            return self.keyword_search_group_messages(channel, group_id, limit);
+        }
+
+        // Filter by cosine similarity threshold before group_id scoping.
+        // Cosine distance from sqlite-vec = 1 - cosine_similarity, so
+        // similarity >= MIN_SIMILARITY  ↔  distance <= 1.0 - MIN_SIMILARITY.
+        // 0.3 is intentionally lower than doc RAG (0.42) because chat messages
+        // are short and produce lower absolute similarity scores.
+        const MIN_SIMILARITY: f64 = 0.3;
+        let ids: Vec<String> = candidates
+            .into_iter()
+            .filter(|(_, dist)| *dist <= 1.0 - MIN_SIMILARITY)
+            .map(|(id, _)| id)
+            .collect();
+        let conn = self.connection()?;
+
+        let mut results = Vec::new();
+        for id in &ids {
+            if results.len() >= limit {
+                break;
+            }
+            let row = conn.query_row(
+                "SELECT user_id, text FROM group_chat_messages WHERE id = ? AND channel = ? AND group_id = ?",
+                params![id, channel, group_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            );
+            if let Ok(pair) = row {
+                results.push(pair);
+            }
+        }
+
+        if results.is_empty() {
+            drop(conn);
+            return self.keyword_search_group_messages(channel, group_id, limit);
+        }
+
+        Ok(results)
+    }
+
+    fn keyword_search_group_messages(
+        &self,
+        channel: &str,
+        group_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT user_id, text FROM group_chat_messages
+                 WHERE channel = ? AND group_id = ?
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .map_err(|e| Error::Database(format!("failed to prepare keyword search: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![channel, group_id, limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::Database(format!("keyword search failed: {e}")))?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Database(format!("failed to collect keyword results: {e}")))
+    }
+
+    /// Count stored messages for a group.
+    pub fn count_group_messages(&self, channel: &str, group_id: &str) -> Result<usize> {
+        let conn = self.connection()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM group_chat_messages WHERE channel = ? AND group_id = ?",
+                params![channel, group_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Database(format!("failed to count group messages: {e}")))?;
+        Ok(count as usize)
+    }
+
+    /// Delete all stored messages for a group. Returns the number of rows deleted.
+    pub fn clear_group_messages(&self, channel: &str, group_id: &str) -> Result<usize> {
+        let conn = self.connection()?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM group_chat_messages WHERE channel = ? AND group_id = ?",
+                params![channel, group_id],
+            )
+            .map_err(|e| Error::Database(format!("failed to clear group messages: {e}")))?;
+        Ok(deleted)
     }
 
     /// Create or verify that a `vec0` virtual table exists for the given dimensionality.
@@ -231,6 +369,110 @@ fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Insert a group message with a synthetic embedding and return the store.
+    fn store_with_group_messages() -> VectorStore {
+        let store = VectorStore::in_memory().expect("in-memory store");
+        // dim=3 for simplicity
+        // msg A: "ประชุมทีม dev 10 คน" → embedding points toward [1,0,0]
+        // msg B: "สวัสดีครับ" → embedding points toward [0,1,0] (unrelated)
+        store
+            .insert_group_message(
+                "line",
+                "group-1",
+                "user-A",
+                "ประชุมทีม dev 10 คน",
+                &[1.0, 0.0, 0.0],
+                3,
+            )
+            .expect("insert A");
+        store
+            .insert_group_message("line", "group-1", "user-B", "สวัสดีครับ", &[0.0, 1.0, 0.0], 3)
+            .expect("insert B");
+        store
+    }
+
+    #[test]
+    fn search_group_messages_returns_relevant_only() {
+        let store = store_with_group_messages();
+        if !store.vec_enabled() {
+            eprintln!("sqlite-vec not available, skipping");
+            return;
+        }
+
+        // Query similar to "ประชุม" (close to [1,0,0])
+        let query = [0.99, 0.1, 0.0];
+        let results = store
+            .search_group_messages("line", "group-1", &query, 3, 5)
+            .expect("search");
+
+        // Should return msg A (high similarity), not msg B (low similarity / filtered by threshold)
+        assert!(!results.is_empty(), "should return at least one result");
+        let texts: Vec<&str> = results.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(
+            texts.contains(&"ประชุมทีม dev 10 คน"),
+            "relevant message should be returned: {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"สวัสดีครับ"),
+            "unrelated message should be filtered out: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn search_group_messages_falls_back_to_keyword_when_all_filtered() {
+        let store = store_with_group_messages();
+        if !store.vec_enabled() {
+            eprintln!("sqlite-vec not available, skipping");
+            return;
+        }
+
+        // Query orthogonal to everything stored → all below threshold → keyword fallback
+        // keyword fallback returns by recency so both messages should come back
+        let query = [0.0, 0.0, 1.0];
+        let results = store
+            .search_group_messages("line", "group-1", &query, 3, 5)
+            .expect("search orthogonal");
+
+        // Keyword fallback returns recent messages regardless of relevance
+        assert!(
+            !results.is_empty(),
+            "keyword fallback should return results"
+        );
+    }
+
+    #[test]
+    fn search_group_messages_scoped_to_group() {
+        let store = store_with_group_messages();
+        if !store.vec_enabled() {
+            eprintln!("sqlite-vec not available, skipping");
+            return;
+        }
+
+        // Insert message into a different group
+        store
+            .insert_group_message(
+                "line",
+                "group-2",
+                "user-C",
+                "ข้อมูลลับกลุ่ม 2",
+                &[1.0, 0.0, 0.0],
+                3,
+            )
+            .expect("insert group-2");
+
+        // Query group-1 should NOT return group-2's message
+        let query = [1.0, 0.0, 0.0];
+        let results = store
+            .search_group_messages("line", "group-1", &query, 3, 5)
+            .expect("search group-1");
+
+        let texts: Vec<&str> = results.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(
+            !texts.contains(&"ข้อมูลลับกลุ่ม 2"),
+            "group-2 message must not leak into group-1 results"
+        );
+    }
 
     #[test]
     fn in_memory_creates_embeddings_table() {

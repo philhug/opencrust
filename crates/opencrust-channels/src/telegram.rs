@@ -84,6 +84,7 @@ impl ErrorHandler<RequestError> for TelegramPollingErrorHandler {
 
 pub struct TelegramChannel {
     bot_token: String,
+    name: String,
     display: String,
     status: ChannelStatus,
     on_message: OnMessageFn,
@@ -105,6 +106,7 @@ impl TelegramChannel {
     ) -> Self {
         Self {
             bot_token,
+            name: "telegram".to_string(),
             display: "Telegram".to_string(),
             status: ChannelStatus::Disconnected,
             on_message,
@@ -113,6 +115,12 @@ impl TelegramChannel {
             bot: None,
             shutdown_tx: None,
         }
+    }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 }
 
@@ -136,10 +144,27 @@ async fn download_telegram_file(
         .await
         .map_err(|e| format!("telegram file download failed: {e}"))?;
 
+    if let Some(len) = response.content_length()
+        && len > crate::MAX_DOWNLOAD_BYTES as u64
+    {
+        return Err(format!(
+            "telegram file too large: {len} bytes exceeds {} byte limit",
+            crate::MAX_DOWNLOAD_BYTES
+        ));
+    }
+
     let bytes = response
         .bytes()
         .await
         .map_err(|e| format!("telegram file read failed: {e}"))?;
+
+    if bytes.len() > crate::MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "telegram file too large: {} bytes exceeds {} byte limit",
+            bytes.len(),
+            crate::MAX_DOWNLOAD_BYTES
+        ));
+    }
 
     Ok(bytes.to_vec())
 }
@@ -184,16 +209,15 @@ fn is_bot_mentioned(msg: &teloxide::types::Message, bot_username: &str) -> bool 
                         }
                     }
                 }
-                teloxide::types::MessageEntityKind::TextMention { user } => {
+                teloxide::types::MessageEntityKind::TextMention { user }
                     if user.is_bot
                         && user
                             .username
                             .as_deref()
                             .map(|u| u.eq_ignore_ascii_case(bot_username))
-                            .unwrap_or(false)
-                    {
-                        return true;
-                    }
+                            .unwrap_or(false) =>
+                {
+                    return true;
                 }
                 _ => {}
             }
@@ -279,12 +303,17 @@ async fn extract_content(
 /// Lightweight send-only handle for Telegram. Holds a pre-built `Bot` instance.
 pub struct TelegramSender {
     bot: Bot,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for TelegramSender {
     fn channel_type(&self) -> &str {
         "telegram"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -301,6 +330,7 @@ impl ChannelLifecycle for TelegramChannel {
     fn create_sender(&self) -> Box<dyn ChannelSender> {
         Box::new(TelegramSender {
             bot: Bot::new(&self.bot_token),
+            name: self.name.clone(),
         })
     }
 
@@ -585,6 +615,10 @@ impl ChannelSender for TelegramChannel {
         "telegram"
     }
 
+    fn channel_name(&self) -> &str {
+        &self.name
+    }
+
     async fn send_message(&self, message: &Message) -> Result<()> {
         let bot = self
             .bot
@@ -671,6 +705,44 @@ mod tests {
         assert_eq!(channel.channel_type(), "telegram");
         assert_eq!(channel.display_name(), "Telegram");
         assert_eq!(channel.status(), ChannelStatus::Disconnected);
+    }
+
+    #[test]
+    fn channel_name_defaults_to_telegram() {
+        let on_msg: OnMessageFn = Arc::new(
+            |_chat_id, _uid, _user, _text, _is_group, _attachment, _delta_tx| {
+                Box::pin(async { Ok(ChannelResponse::Text("test".to_string())) })
+            },
+        );
+        let channel = TelegramChannel::new("fake-token".to_string(), on_msg);
+        assert_eq!(channel.channel_name(), "telegram");
+    }
+
+    #[test]
+    fn with_name_overrides_channel_name() {
+        let on_msg: OnMessageFn = Arc::new(
+            |_chat_id, _uid, _user, _text, _is_group, _attachment, _delta_tx| {
+                Box::pin(async { Ok(ChannelResponse::Text("test".to_string())) })
+            },
+        );
+        let channel = TelegramChannel::new("fake-token".to_string(), on_msg)
+            .with_name("tg-support".to_string());
+        assert_eq!(channel.channel_name(), "tg-support");
+        assert_eq!(channel.channel_type(), "telegram");
+    }
+
+    #[test]
+    fn sender_channel_name_inherits_from_channel() {
+        let on_msg: OnMessageFn = Arc::new(
+            |_chat_id, _uid, _user, _text, _is_group, _attachment, _delta_tx| {
+                Box::pin(async { Ok(ChannelResponse::Text("test".to_string())) })
+            },
+        );
+        let channel =
+            TelegramChannel::new("fake-token".to_string(), on_msg).with_name("tg-ops".to_string());
+        let sender = channel.create_sender();
+        assert_eq!(sender.channel_name(), "tg-ops");
+        assert_eq!(sender.channel_type(), "telegram");
     }
 
     #[test]
@@ -876,5 +948,12 @@ mod tests {
         let filter: GroupFilter = Arc::new(|_mentioned| true);
         assert!(filter(false));
         assert!(filter(true));
+    }
+
+    // --- download size-limit tests ---
+
+    #[test]
+    fn download_size_limit_constant_is_10_mib() {
+        assert_eq!(crate::MAX_DOWNLOAD_BYTES, 10 * 1024 * 1024);
     }
 }

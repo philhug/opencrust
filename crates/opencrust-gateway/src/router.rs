@@ -145,12 +145,14 @@ async fn web_chat(axum::extract::State(state): axum::extract::State<SharedState>
             include_str!("webchat.html").to_string()
         };
 
-    // Inject the gateway key (if configured) so the webchat frontend can
-    // authenticate without requiring the user to enter it manually.
-    let inject = if let Some(key) = state.config.gateway.api_key.as_deref() {
+    // Issue a short-lived webchat token and inject it instead of the real
+    // gateway API key.  The token is validated server-side on WebSocket
+    // upgrade so the real key is never exposed in the page source.
+    let inject = if state.config.gateway.api_key.is_some() {
+        let token = state.issue_webchat_token();
         format!(
             "<script>window.__OPENCRUST_GATEWAY_KEY__={:?};</script>",
-            key
+            token
         )
     } else {
         String::new()
@@ -409,6 +411,17 @@ async fn upload_file(
             axum::Json(serde_json::json!({
                 "status": "error",
                 "message": format!("file exceeds maximum size of {} MB", MAX_UPLOAD_BYTES / 1024 / 1024),
+            })),
+        )
+            .into_response();
+    }
+
+    if !opencrust_media::is_supported_for_ingest(&filename) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error",
+                "message": format!("unsupported file type: {filename}"),
             })),
         )
             .into_response();

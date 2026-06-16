@@ -68,29 +68,62 @@ cargo build --release --features plugins
 ```
 </details>
 
+### Web Chat
+
+Once the gateway is running, open your browser at:
+
+```
+http://127.0.0.1:3888
+```
+
+The built-in web UI lets you chat with your agent, switch LLM providers on the fly, manage MCP servers, and monitor connected channels — all without restarting.
+
+> **Authentication** — if `api_key` is set in `config.yml`, the UI will prompt for the gateway key before connecting.
+
+### Terminal Chat
+
+Chat with your agent directly from the terminal — no browser needed.
+
+> **Requires a running gateway.** Run `opencrust init` (first time only) then `opencrust start` before using `opencrust chat`.
+
+```bash
+# First-time setup
+opencrust init
+opencrust start           # or: opencrust start -d  (daemon mode)
+
+# Open terminal chat
+opencrust chat
+opencrust chat --agent coder           # start with a named agent
+opencrust chat --url http://host:3888  # connect to a remote gateway
+```
+
+<img src="assets/demo.gif" alt="OpenCrust terminal chat demo" width="720">
+
+**Chat commands:** `/help` · `/new` (fresh session) · `/agent <id>` · `/clear` · `/exit`
+
 Pre-compiled binaries for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows (x86_64) are available on [GitHub Releases](https://github.com/opencrust-org/opencrust/releases).
 
 ## Why OpenCrust?
 
-### vs OpenClaw, ZeroClaw, and other AI agent frameworks
-
-| | **OpenCrust** | **OpenClaw** (Node.js) | **ZeroClaw** (Rust) |
-|---|---|---|---|
-| **Binary size** | 16 MB | ~1.2 GB (with node_modules) | ~25 MB |
-| **Memory at idle** | 13 MB | ~388 MB | ~20 MB |
-| **Cold start** | 3 ms | 13.9 s | ~50 ms |
-| **Credential storage** | AES-256-GCM encrypted vault | Plaintext config file | Plaintext config file |
-| **Auth default** | Enabled (WebSocket pairing) | Disabled by default | Disabled by default |
-| **Scheduling** | Cron, interval, one-shot | Yes | No |
-| **Multi-agent routing** | Yes (named agents) | Yes (agentId) | No |
-| **Session orchestration** | Yes | Yes | No |
-| **MCP support** | Stdio + HTTP | Stdio + HTTP | Stdio |
-| **Channels** | 9 | 6+ | 4 |
-| **LLM providers** | 15 | 10+ | 22+ |
-| **Pre-compiled binaries** | Yes | N/A (Node.js) | Build from source |
-| **Config hot-reload** | Yes | No | No |
-| **WASM plugin system** | Optional (sandboxed) | No | No |
-| **Self-update** | Yes (`opencrust update`) | npm | Build from source |
+| | |
+|---|---|
+| **Binary size** | 16 MB single binary |
+| **Memory at idle** | 13 MB |
+| **Cold start** | 3 ms |
+| **Credential storage** | AES-256-GCM encrypted vault |
+| **Auth default** | Enabled (WebSocket pairing) |
+| **Scheduling** | Cron, interval, one-shot |
+| **Multi-agent routing** | Yes (named agents) |
+| **Session orchestration** | Yes |
+| **MCP support** | Stdio + HTTP |
+| **Channels** | 9 |
+| **LLM providers** | 15 |
+| **Pre-compiled binaries** | Yes |
+| **Config hot-reload** | Yes |
+| **Plugin system** | WASM (sandboxed) |
+| **Self-update** | Yes (`opencrust update`) |
+| **Security scan** | ✅ skills prompt-injection scan before install |
+| **Self-improvement** | ✅ cross-session patterns, skill lifecycle, confidence gate |
 
 *Benchmarks measured on a 1 vCPU, 1 GB RAM DigitalOcean droplet.*
 
@@ -175,14 +208,57 @@ OpenCrust is built for the security requirements of always-on AI agents that acc
 - Context window management - rolling conversation summarization at 75% context window
 - Scheduled tasks - cron, interval, and one-shot scheduling
 
+### Document RAG
+
+Ingest documents into the agent's knowledge base — the agent automatically retrieves and cites relevant excerpts when answering questions, with no extra commands needed.
+
+**Ingesting a document:**
+
+Send a file to any channel, then reply `!ingest` to store it. Use `!ingest replace` to overwrite an existing version.
+
+```bash
+# Via REST API
+curl -X POST http://localhost:8080/api/ingest \
+  -F "file=@report.pdf" \
+  -F "session_id=default"
+```
+
+**Supported file types:** PDF, Markdown, plain text, CSV, JSON, HTML, and source code (`.rs`, `.py`, `.js`, `.ts`, `.go`, `.java`, `.toml`, `.yaml`)
+
+**How it works:**
+
+1. Document is chunked and stored in SQLite (`~/.opencrust/data/documents.db`)
+2. Each chunk is embedded via the configured embedding provider (Cohere by default)
+3. On every message, a **hybrid search** (vector + keyword, top 3 chunks, similarity threshold 0.42) runs automatically
+4. Matching chunks are injected into the user message before the LLM sees it
+5. The agent cites the source document name and relevance score in its reply
+
+**Manual search:**
+
+Use the `doc_search` tool directly: `doc_search("annual report revenue")`
+
+**Embedding provider (optional):**
+
+Without an embedding provider, RAG falls back to keyword-only search. Add Cohere to `config.yml` for semantic (vector) retrieval:
+
+```yaml
+embeddings:
+  provider: cohere
+  api_key: your-cohere-key
+```
+
 ### Skills
 - Define agent skills as Markdown files (SKILL.md) with YAML frontmatter
 - Auto-discovery from `~/.opencrust/skills/` - injected into the system prompt
 - Hot-reload — skills are active immediately after `create_skill` or `skill install`, no restart needed
 - CLI: `opencrust skill list`, `opencrust skill install <url|path>`, `opencrust skill remove <name>`
-- **Self-learning** — agent proactively considers saving reusable workflows after completing 3+ tool calls; nudge appears at end of response
+- **Self-learning & self-improvement** — the agent tracks tool-call sequences across sessions; once a workflow repeats 5+ times it automatically saves a new skill (rate-limited to avoid noise); when reusing an existing skill it silently self-assesses and patches it if a gap is found (confidence gate prevents low-signal patches; version is bumped and CHANGELOG.md updated on every patch)
+- **Automatic skill lifecycle** — skills unused for 30+ days are archived automatically (renamed to `<name>.archived`); session trajectory data older than 90 days is compressed daily by the LLM, with skill candidates preserved for continued pattern detection
 - `agent.self_learning: false` in `config.yml` to disable
 - 3-layer quality control: prompt guidance, mechanical limits (max 30 skills, min body length, duplicate guard), and required `rationale` field stored in the skill file for auditability
+- **[agentskills.io](https://agentskills.io) compatible** — install community skills from any public hub with `opencrust skill install <url>`; flat (`skill-name.md`) and folder (`skill-name/SKILL.md`) layouts coexist automatically, no migration needed
+- **Security scan** — every skill is scanned for prompt-injection patterns before installation, whether from a URL, local file, or agent-created
+- **Agent skill editing** — agent can `patch` an existing skill (update body, description, or triggers) and `write_file` to add supplementary `.md` files inside a skill folder
 
 ### Multi-Agent Orchestration
 
@@ -337,8 +413,8 @@ guardrails:
 
 gateway:
   rate_limit:
-    max_messages_per_minute: 10     # per-user message rate limit
-    cooldown_seconds: 30            # cooldown period after limit is exceeded
+    per_user_per_minute: 10         # per-user message rate limit
+    cooldown_secs: 30               # cooldown period after limit is exceeded
 
 memory:
   enabled: true

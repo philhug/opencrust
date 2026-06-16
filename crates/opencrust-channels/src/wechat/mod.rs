@@ -69,6 +69,7 @@ pub struct WeChatChannel {
     /// Verification token configured in the WeChat Official Account console.
     pub(crate) token: String,
     api_base_url: String,
+    name: String,
     display: String,
     status: ChannelStatus,
     on_message: WeChatOnMessageFn,
@@ -101,6 +102,7 @@ impl WeChatChannel {
             secret,
             token,
             api_base_url: api::WECHAT_API_BASE.to_string(),
+            name: "wechat".to_string(),
             display: "WeChat".to_string(),
             status: ChannelStatus::Disconnected,
             on_message,
@@ -108,6 +110,12 @@ impl WeChatChannel {
             token_cache: Arc::new(RwLock::new(None)),
             msg_id_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     /// Override the WeChat API base URL (e.g. to point at a mock server in tests).
@@ -198,12 +206,17 @@ pub struct WeChatSender {
     secret: String,
     api_base_url: String,
     token_cache: TokenCache,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for WeChatSender {
     fn channel_type(&self) -> &str {
         "wechat"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -232,6 +245,7 @@ impl ChannelLifecycle for WeChatChannel {
             secret: self.secret.clone(),
             api_base_url: self.api_base_url.clone(),
             token_cache: Arc::clone(&self.token_cache),
+            name: self.name.clone(),
         })
     }
 
@@ -258,6 +272,10 @@ impl ChannelLifecycle for WeChatChannel {
 impl ChannelSender for WeChatChannel {
     fn channel_type(&self) -> &str {
         "wechat"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

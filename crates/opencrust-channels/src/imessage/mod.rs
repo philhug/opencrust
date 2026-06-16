@@ -41,6 +41,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct IMessageChannel {
     poll_interval: Duration,
+    name: String,
     status: ChannelStatus,
     on_message: IMessageOnMessageFn,
     group_filter: IMessageGroupFilter,
@@ -59,21 +60,34 @@ impl IMessageChannel {
     ) -> Self {
         Self {
             poll_interval: Duration::from_secs(poll_interval_secs),
+            name: "imessage".to_string(),
             status: ChannelStatus::Disconnected,
             on_message,
             group_filter,
             shutdown_tx: None,
         }
     }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
 }
 
-/// Lightweight send-only handle for iMessage. Stateless (uses osascript).
-pub struct IMessageSender;
+/// Lightweight send-only handle for iMessage. Uses osascript.
+pub struct IMessageSender {
+    name: String,
+}
 
 #[async_trait]
 impl ChannelSender for IMessageSender {
     fn channel_type(&self) -> &str {
         "imessage"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -88,7 +102,9 @@ impl ChannelLifecycle for IMessageChannel {
     }
 
     fn create_sender(&self) -> Box<dyn ChannelSender> {
-        Box::new(IMessageSender)
+        Box::new(IMessageSender {
+            name: self.name.clone(),
+        })
     }
 
     async fn connect(&mut self) -> Result<()> {
@@ -258,6 +274,10 @@ impl ChannelLifecycle for IMessageChannel {
 impl ChannelSender for IMessageChannel {
     fn channel_type(&self) -> &str {
         "imessage"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

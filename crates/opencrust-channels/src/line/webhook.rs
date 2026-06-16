@@ -148,22 +148,41 @@ pub async fn line_webhook(
 
         // Detect @mention: LINE includes mention data in message.mention.mentionees.
         // Each mentionee has a `userId` field; match against the bot's own userId.
+        let bot_uid = channel.bot_user_id();
         let is_mentioned = if is_group {
-            let bot_uid = channel.bot_user_id().unwrap_or("");
+            let bot_uid_str = bot_uid.unwrap_or("");
             msg.get("mention")
                 .and_then(|m| m.get("mentionees"))
                 .and_then(|v| v.as_array())
                 .map(|mentionees| {
                     mentionees
                         .iter()
-                        .any(|m| m.get("userId").and_then(|v| v.as_str()) == Some(bot_uid))
+                        .any(|m| m.get("userId").and_then(|v| v.as_str()) == Some(bot_uid_str))
                 })
                 .unwrap_or(false)
         } else {
             false
         };
 
-        if is_group && !channel.group_filter()(is_mentioned) {
+        // Embed every group text message for RAG (fire-and-forget, skips bot's own messages).
+        let is_bot_message = bot_uid == Some(user_id.as_str());
+        if is_group
+            && !text.is_empty()
+            && !is_bot_message
+            && !is_mentioned
+            && let Some(observe_fn) = channel.group_observe_fn().cloned()
+        {
+            let gid = context_id.clone();
+            let uid = user_id.clone();
+            let msg = text.clone();
+            tokio::spawn(observe_fn(gid, uid, msg));
+        }
+
+        // File messages bypass the mention filter when group RAG is enabled,
+        // so the bot can prompt for !ingest regardless of mention.
+        let has_file = file_info.is_some();
+        let rag_enabled = channel.group_observe_fn().is_some();
+        if is_group && !(has_file && rag_enabled) && !channel.group_filter()(is_mentioned) {
             continue;
         }
 

@@ -35,7 +35,7 @@ impl GatewayServer {
     pub async fn run(self) -> Result<()> {
         let addr = format!("{}:{}", self.config.gateway.host, self.config.gateway.port);
 
-        let mut agents = build_agent_runtime(&self.config).await;
+        let (mut agents, send_msg_handle) = build_agent_runtime(&self.config).await;
 
         // Connect MCP servers and register their tools
         let (mcp_manager_arc, mcp_tools, mcp_instructions) = build_mcp_tools(&self.config).await;
@@ -88,9 +88,38 @@ impl GatewayServer {
             }
         };
 
-        // Wrap in Arc now that all &mut setup is complete, then wire the HandoffTool.
+        // Wrap in Arc now that all &mut setup is complete, then wire deferred tools.
         let agents = Arc::new(agents);
         handoff_handle.wire(&agents);
+
+        // Run trajectory compression and skill pruning at startup, then daily.
+        {
+            let agents_maintenance = Arc::clone(&agents);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(86_400));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let n = agents_maintenance.compress_old_trajectories(90).await;
+                    if n > 0 {
+                        tracing::info!("trajectory compression: compressed {n} old session(s)");
+                    }
+                    let pruned = agents_maintenance.prune_unused_skills();
+                    if !pruned.is_empty() {
+                        tracing::info!(
+                            "skill pruning: archived {} unused skill(s): {}",
+                            pruned.len(),
+                            pruned.join(", ")
+                        );
+                    }
+                }
+            });
+        }
+        // SendMessageTool: create an outbound channel and wire the tool now.
+        // The dispatcher task is spawned later, after channel_senders are populated.
+        let (send_tx, send_rx) =
+            tokio::sync::mpsc::channel::<opencrust_agents::OutboundMessage>(64);
+        send_msg_handle.wire(send_tx);
         let mut state = AppState::new(self.config, Arc::clone(&agents), channels);
         state.mcp_manager_arc = Some(Arc::clone(&mcp_manager_arc));
 
@@ -179,7 +208,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             tokio::spawn(async move {
                 if let Err(e) = channel.connect().await {
                     warn!("discord channel failed to connect: {e}");
@@ -225,7 +254,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             tokio::spawn(async move {
                 if let Err(e) = channel.connect().await {
                     warn!("telegram channel failed to connect: {e}");
@@ -242,7 +271,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             tokio::spawn(async move {
                 if let Err(e) = channel.connect().await {
                     warn!("slack channel failed to connect: {e}");
@@ -261,7 +290,7 @@ impl GatewayServer {
                 let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
                 state
                     .channel_senders
-                    .insert(sender.channel_type().to_string(), sender);
+                    .insert(sender.channel_name().to_string(), sender);
                 tokio::spawn(async move {
                     if let Err(e) = channel.connect().await {
                         warn!("imessage channel failed to connect: {e}");
@@ -279,7 +308,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             info!(
                 "whatsapp channel ready (webhook mode, phone_number_id={})",
                 channel.phone_number_id()
@@ -294,7 +323,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             tokio::spawn(async move {
                 if let Err(e) = channel.connect().await {
                     warn!("whatsapp-web channel failed to connect: {e}");
@@ -318,7 +347,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             info!("line channel ready (webhook mode)");
         }
         let line_state: opencrust_channels::line::webhook::LineWebhookState =
@@ -329,7 +358,7 @@ impl GatewayServer {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
             state
                 .channel_senders
-                .insert(sender.channel_type().to_string(), sender);
+                .insert(sender.channel_name().to_string(), sender);
             info!("wechat channel ready (webhook mode)");
         }
         let wechat_state: opencrust_channels::wechat::webhook::WeChatWebhookState =
@@ -339,10 +368,9 @@ impl GatewayServer {
         let mut mqtt_channels = build_mqtt_channels(&state.config, &state);
         for mut channel in mqtt_channels.drain(..) {
             let sender: Arc<dyn ChannelSender> = Arc::from(channel.create_sender());
-            // Key by channel name to support multiple mqtt instances
             state
                 .channel_senders
-                .insert(format!("mqtt-{}", sender.channel_type()), sender);
+                .insert(sender.channel_name().to_string(), sender);
             tokio::spawn(async move {
                 if let Err(e) = channel.connect().await {
                     warn!("mqtt channel failed to connect: {e}");
@@ -350,6 +378,57 @@ impl GatewayServer {
                 }
                 shutdown_signal().await;
                 channel.disconnect().await.ok();
+            });
+        }
+
+        // Spawn the send_message dispatcher now that all channel_senders are registered.
+        // Routes OutboundMessage from the agent tool to the correct channel adapter.
+        {
+            let dispatcher_state = Arc::clone(&state);
+            let mut rx = send_rx;
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    let Some(sender) = dispatcher_state
+                        .channel_senders
+                        .get(msg.channel_id.as_str())
+                        .map(|s| Arc::clone(&*s))
+                    else {
+                        tracing::warn!(
+                            channel_id = %msg.channel_id,
+                            "send_message: no sender registered for channel"
+                        );
+                        continue;
+                    };
+                    let metadata = match msg.channel_id.as_str() {
+                        "telegram" => {
+                            let chat_id: i64 = msg.recipient_id.parse().unwrap_or(0);
+                            serde_json::json!({ "telegram_chat_id": chat_id })
+                        }
+                        "line" => serde_json::json!({ "line_user_id": msg.recipient_id }),
+                        _ => serde_json::json!({ "recipient_id": msg.recipient_id }),
+                    };
+                    let mut message = Message::text(
+                        SessionId::new(),
+                        ChannelId::from_string(msg.channel_id.clone()),
+                        UserId::new(),
+                        MessageDirection::Outgoing,
+                        msg.text.clone(),
+                    );
+                    message.metadata = metadata;
+                    if let Err(e) = sender.send_message(&message).await {
+                        tracing::warn!(
+                            channel_id = %msg.channel_id,
+                            recipient_id = %msg.recipient_id,
+                            "send_message delivery failed: {e}"
+                        );
+                    } else {
+                        tracing::info!(
+                            channel_id = %msg.channel_id,
+                            recipient_id = %msg.recipient_id,
+                            "send_message delivered"
+                        );
+                    }
+                }
             });
         }
 

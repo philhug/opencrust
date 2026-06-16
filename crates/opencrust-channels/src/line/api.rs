@@ -27,10 +27,29 @@ pub async fn download_content(
         return Err(format!("line download_content error {status}: {body}"));
     }
 
-    resp.bytes()
+    if let Some(len) = resp.content_length()
+        && len > crate::MAX_DOWNLOAD_BYTES as u64
+    {
+        return Err(format!(
+            "line file too large: {len} bytes exceeds {} byte limit",
+            crate::MAX_DOWNLOAD_BYTES
+        ));
+    }
+
+    let bytes = resp
+        .bytes()
         .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("line download_content read failed: {e}"))
+        .map_err(|e| format!("line download_content read failed: {e}"))?;
+
+    if bytes.len() > crate::MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "line file too large: {} bytes exceeds {} byte limit",
+            bytes.len(),
+            crate::MAX_DOWNLOAD_BYTES
+        ));
+    }
+
+    Ok(bytes.to_vec())
 }
 
 /// Send a reply using a reply token (free, expires in 30 seconds, one use).
@@ -115,6 +134,41 @@ pub async fn get_bot_info(
     })
 }
 
+/// Fetch a group member's display name.
+///
+/// Uses `GET {base_url}/group/{group_id}/member/{user_id}`.
+/// Works even if the user has not added the bot as a friend.
+/// Falls back gracefully — callers should use `user_id` on error.
+pub async fn get_group_member_display_name(
+    client: &Client,
+    channel_access_token: &str,
+    group_id: &str,
+    user_id: &str,
+    base_url: &str,
+) -> Result<String, String> {
+    let resp = client
+        .get(format!("{base_url}/group/{group_id}/member/{user_id}"))
+        .bearer_auth(channel_access_token)
+        .send()
+        .await
+        .map_err(|e| format!("line get_group_member_display_name request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(format!("line get_group_member_display_name error {status}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("line get_group_member_display_name parse failed: {e}"))?;
+
+    json.get("displayName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "line get_group_member_display_name: displayName missing".to_string())
+}
+
 /// Send a push message to a user ID (paid tier, works at any time).
 pub async fn push(
     client: &Client,
@@ -142,5 +196,13 @@ pub async fn push(
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
         Err(format!("line push failed ({status}): {body_text}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn download_size_limit_constant_is_10_mib() {
+        assert_eq!(crate::MAX_DOWNLOAD_BYTES, 10 * 1024 * 1024);
     }
 }

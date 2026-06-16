@@ -408,14 +408,15 @@ fn import_channels(source_dir: &Path, opencrust_dir: &Path, report: &mut Migrati
         report.channels_imported += 1;
     }
 
-    if !report.dry_run
-        && report.channels_imported > 0
-        && let Ok(yaml_str) = serde_yaml::to_string(&opencrust_config)
-        && let Err(e) = std::fs::write(&opencrust_config_path, yaml_str)
-    {
-        report
-            .errors
-            .push(format!("failed to write updated config: {e}"));
+    if !report.dry_run && report.channels_imported > 0 {
+        opencrust_config::try_backup_file(&opencrust_config_path);
+        if let Ok(yaml_str) = serde_yaml::to_string(&opencrust_config)
+            && let Err(e) = std::fs::write(&opencrust_config_path, yaml_str)
+        {
+            report
+                .errors
+                .push(format!("failed to write updated config: {e}"));
+        }
     }
 }
 

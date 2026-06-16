@@ -59,6 +59,7 @@ pub type SlackOnMessageFn = Arc<
 pub struct SlackChannel {
     bot_token: String,
     app_token: String,
+    name: String,
     display: String,
     status: ChannelStatus,
     on_message: SlackOnMessageFn,
@@ -82,6 +83,7 @@ impl SlackChannel {
         Self {
             bot_token,
             app_token,
+            name: "slack".to_string(),
             display: "Slack".to_string(),
             status: ChannelStatus::Disconnected,
             on_message,
@@ -90,17 +92,28 @@ impl SlackChannel {
             shutdown_tx: None,
         }
     }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
 }
 
 /// Lightweight send-only handle for Slack. Holds a bot token for API calls.
 pub struct SlackSender {
     bot_token: String,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for SlackSender {
     fn channel_type(&self) -> &str {
         "slack"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -117,6 +130,7 @@ impl ChannelLifecycle for SlackChannel {
     fn create_sender(&self) -> Box<dyn ChannelSender> {
         Box::new(SlackSender {
             bot_token: self.bot_token.clone(),
+            name: self.name.clone(),
         })
     }
 
@@ -183,6 +197,10 @@ impl ChannelLifecycle for SlackChannel {
 impl ChannelSender for SlackChannel {
     fn channel_type(&self) -> &str {
         "slack"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

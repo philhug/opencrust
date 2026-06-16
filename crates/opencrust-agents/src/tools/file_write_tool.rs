@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use opencrust_common::{Error, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -9,12 +9,24 @@ const MAX_WRITE_BYTES: usize = 1024 * 1024; // 1MB
 /// Write content to a file with path validation and size limits.
 pub struct FileWriteTool {
     allowed_directories: Option<Vec<PathBuf>>,
+    protected_config_dir: PathBuf,
 }
 
 impl FileWriteTool {
     pub fn new(allowed_directories: Option<Vec<PathBuf>>) -> Self {
+        Self::new_with_config_dir(
+            allowed_directories,
+            opencrust_config::ConfigLoader::default_config_dir(),
+        )
+    }
+
+    fn new_with_config_dir(
+        allowed_directories: Option<Vec<PathBuf>>,
+        protected_config_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             allowed_directories,
+            protected_config_dir: protected_config_dir.into(),
         }
     }
 
@@ -41,6 +53,43 @@ impl FileWriteTool {
 
         Ok(())
     }
+
+    fn should_backup_before_write(&self, path: &std::path::Path) -> bool {
+        is_protected_agent_state_path(path, &self.protected_config_dir)
+    }
+}
+
+/// File-write-managed agent state that should be backed up before overwrite.
+///
+/// This covers only explicitly protected files in the config directory:
+/// - `dna.md`
+/// - `mcp.json`
+fn is_protected_agent_state_path(path: &Path, config_dir: &Path) -> bool {
+    let path = normalize_with_existing_parent(path);
+    let config_dir = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+
+    if path.parent() != Some(config_dir.as_path()) {
+        return false;
+    }
+
+    path.file_name()
+        .is_some_and(|name| name == "dna.md" || name == "mcp.json")
+}
+
+fn normalize_with_existing_parent(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+
+    parent
+        .canonicalize()
+        .map(|parent| parent.join(file_name))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[async_trait]
@@ -103,6 +152,10 @@ impl Tool for FileWriteTool {
                 .map_err(|e| Error::Agent(format!("failed to create directories: {e}")))?;
         }
 
+        if self.should_backup_before_write(&path) {
+            opencrust_config::try_backup_file(&path);
+        }
+
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| Error::Agent(format!("failed to write file: {e}")))?;
@@ -163,5 +216,77 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn backs_up_existing_protected_config_files_before_overwrite() {
+        let dir = TempDir::new().unwrap();
+        for file_name in ["dna.md", "mcp.json"] {
+            let file_path = dir.path().join(file_name);
+            std::fs::write(&file_path, format!("original {file_name}")).unwrap();
+
+            let tool = FileWriteTool::new_with_config_dir(None, dir.path());
+            let ctx = ToolContext {
+                session_id: "test".into(),
+                user_id: None,
+                heartbeat_depth: 0,
+                allowed_tools: None,
+            };
+            let output = tool
+                .execute(
+                    &ctx,
+                    serde_json::json!({
+                        "path": file_path.to_str().unwrap(),
+                        "content": format!("updated {file_name}")
+                    }),
+                )
+                .await
+                .unwrap();
+
+            assert!(!output.is_error);
+            assert!(
+                std::fs::read_to_string(&file_path)
+                    .unwrap()
+                    .contains(&format!("updated {file_name}"))
+            );
+            assert!(
+                std::fs::read_to_string(file_path.with_file_name(format!("{file_name}.bak.1")))
+                    .unwrap()
+                    .contains(&format!("original {file_name}"))
+            );
+        }
+    }
+
+    #[test]
+    fn protected_agent_state_paths_cover_explicit_file_write_state_only() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills/example"))
+            .expect("failed to create temp dir");
+
+        assert!(is_protected_agent_state_path(
+            &dir.path().join("dna.md"),
+            dir.path()
+        ));
+        assert!(is_protected_agent_state_path(
+            &dir.path().join("mcp.json"),
+            dir.path()
+        ));
+        assert!(!is_protected_agent_state_path(
+            &dir.path().join("notes.md"),
+            dir.path()
+        ));
+
+        assert!(!is_protected_agent_state_path(
+            &dir.path().join("config.yml"),
+            dir.path()
+        ));
+        assert!(!is_protected_agent_state_path(
+            &dir.path().join("dna.md.bak.1"),
+            dir.path()
+        ));
+        assert!(!is_protected_agent_state_path(
+            &dir.path().join("skills/example/SKILL.md"),
+            dir.path()
+        ));
     }
 }

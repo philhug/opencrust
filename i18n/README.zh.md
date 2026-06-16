@@ -68,29 +68,62 @@ cargo build --release --features plugins
 ```
 </details>
 
+### 网页聊天
+
+Gateway 启动后，在浏览器中打开：
+
+```
+http://127.0.0.1:3888
+```
+
+内置 Web UI 让你与 agent 对话、实时切换 LLM provider、管理 MCP server 并监控已连接的 channel — 无需重启。
+
+> **身份验证** — 若 `config.yml` 中设置了 `api_key`，UI 将在连接前提示输入 gateway key。
+
+### 终端聊天
+
+直接在终端与 agent 对话，无需打开浏览器。
+
+> **需要先启动 gateway。** 首次使用请运行 `opencrust init`，然后运行 `opencrust start`，再使用 `opencrust chat`。
+
+```bash
+# 首次设置
+opencrust init
+opencrust start           # 或：opencrust start -d  (后台模式)
+
+# 启动终端聊天
+opencrust chat
+opencrust chat --agent coder           # 使用指定 agent
+opencrust chat --url http://host:3888  # 连接远程 gateway
+```
+
+<img src="../assets/demo.gif" alt="OpenCrust terminal chat demo" width="720">
+
+**聊天命令：** `/help` · `/new`（新建会话）· `/agent <id>` · `/clear` · `/exit`
+
 适用于 Linux (x86_64, aarch64)、macOS (Intel, Apple Silicon) 和 Windows (x86_64) 的预编译二进制文件。可在 [GitHub Releases](https://github.com/opencrust-org/opencrust/releases) 下载。
 
 ## 为什么选择 OpenCrust?
 
-### 与 OpenClaw、ZeroClaw 等 AI 代理框架对比
-
-| | **OpenCrust** | **OpenClaw** (Node.js) | **ZeroClaw** (Rust) |
-|---|---|---|---|
-| **二进制文件大小** | 16 MB | ~1.2 GB (包含 node_modules) | ~25 MB |
-| **空闲状态内存** | 13 MB | ~388 MB | ~20 MB |
-| **冷启动速度** | 3 ms | 13.9 s | ~50 ms |
-| **凭据存储方式** | AES-256-GCM 加密库 | 明文配置文件 | 明文配置文件 |
-| **默认身份验证** | 已启用 (WebSocket 配对) | 默认禁用 | 默认禁用 |
-| **任务调度** | Cron, 间隔, 单次执行 | 是 | 否 |
-| **多代理路由** | 是 (命名代理) | 是 (agentId) | 否 |
-| **会话编排** | 是 | 是 | 否 |
-| **MCP 支持** | Stdio + HTTP | Stdio + HTTP | Stdio |
-| **渠道数量** | 9 | 6+ | 4 |
-| **LLM 供应商数量** | 15 | 10+ | 22+ |
-| **预编译二进制文件** | 是 | 无 (Node.js) | 源码编译 |
-| **配置热重载** | 是 | 否 | 否 |
-| **WASM 插件系统** | 可选 (沙盒隔离) | 否 | 否 |
-| **自动更新** | 是 (`opencrust update`) | npm | 源码编译 |
+| | |
+|---|---|
+| **二进制文件大小** | 16 MB 单文件 |
+| **空闲状态内存** | 13 MB |
+| **冷启动速度** | 3 ms |
+| **凭据存储方式** | AES-256-GCM 加密库 |
+| **默认身份验证** | 已启用 (WebSocket 配对) |
+| **任务调度** | Cron、间隔、单次执行 |
+| **多代理路由** | 是（命名代理） |
+| **会话编排** | 是 |
+| **MCP 支持** | Stdio + HTTP |
+| **渠道数量** | 9 |
+| **LLM 供应商数量** | 15 |
+| **预编译二进制文件** | 是 |
+| **配置热重载** | 是 |
+| **插件系统** | WASM（沙盒隔离） |
+| **自动更新** | 是（`opencrust update`） |
+| **安全扫描** | ✅ 安装前对每个 skill 进行提示注入扫描 |
+| **自我改进** | ✅ 跨 session 模式识别、skill 生命周期管理、confidence gate |
 
 *性能基准测试在 1 vCPU, 1 GB RAM 的 DigitalOcean Droplet 上进行。*
 
@@ -176,14 +209,57 @@ OpenCrust 专门为需要访问私有数据并进行外部通信的“全天候�
 - 上下文窗口管理 —— 在上下文达到 75% 时自动进行滚动摘要
 - 调度任务 —— 支持 Cron、间隔和单次任务调度
 
+### 文档 RAG
+
+将文档导入 agent 的知识库 —— agent 在回答问题时会自动检索并引用相关片段，无需额外命令。
+
+**导入文档：**
+
+向任意 channel 发送文件，然后回复 `!ingest` 进行存储。使用 `!ingest replace` 覆盖已有版本。
+
+```bash
+# 通过 REST API
+curl -X POST http://localhost:8080/api/ingest \
+  -F "file=@report.pdf" \
+  -F "session_id=default"
+```
+
+**支持的文件类型：** PDF、Markdown、纯文本、CSV、JSON、HTML 以及源代码（`.rs`、`.py`、`.js`、`.ts`、`.go`、`.java`、`.toml`、`.yaml`）
+
+**工作原理：**
+
+1. 文档被分块并存储于 SQLite（`~/.opencrust/data/documents.db`）
+2. 每个块通过配置的 embedding 提供商（默认为 Cohere）生成向量
+3. 每次消息时，自动执行**混合搜索**（向量 + 关键词，前 3 个块，相似度阈值 0.42）
+4. 匹配的块在 LLM 处理前注入用户消息
+5. Agent 在回复中引用来源文档名称和相关性评分
+
+**手动搜索：**
+
+直接使用 `doc_search` 工具：`doc_search("annual report revenue")`
+
+**Embedding 提供商（可选）：**
+
+未配置 embedding 提供商时，RAG 将退回到纯关键词搜索。在 `config.yml` 中添加 Cohere 以启用语义（向量）检索：
+
+```yaml
+embeddings:
+  provider: cohere
+  api_key: your-cohere-key
+```
+
 ### 技能
 - 以带有 YAML 元数据的 Markdown 文件 (SKILL.md) 定义代理技能
 - 从 `~/.opencrust/skills/` 自动发现并注入系统提示词
 - 热重载 —— `create_skill` 或 `skill install` 后技能立即生效，无需重启
 - CLI 指令: `opencrust skill list`, `opencrust skill install <url|path>`, `opencrust skill remove <name>`
-- **自主学习** —— agent 在完成 3 次以上工具调用后，会主动考虑保存可复用的工作流；提示信息显示在回复末尾
+- **自主学习与自我优化** —— agent 跨 session 追踪工具调用序列；同一工作流重复出现 5 次以上时自动保存为 skill（设有频率限制以减少噪音）；复用已有 skill 时，agent 会静默自评，发现差距时自动 patch（需通过置信度门槛方可执行；每次 patch 自动升级版本并写入 CHANGELOG.md）
+- **技能生命周期自动管理** —— 超过 30 天未使用的 skill 会被自动归档（重命名为 `<name>.archived`）；超过 90 天的 trajectory 数据每天由 LLM 压缩，同时保留 skill 候选项以持续支持 pattern 检测
 - 在 `config.yml` 中设置 `agent.self_learning: false` 可禁用此功能
 - 三层质量控制：提示词引导、机械限制（最多 30 个技能、最小正文长度、重复检测）以及必填的 `rationale` 字段（存储于技能文件中以供审计）
+- **兼容 [agentskills.io](https://agentskills.io)** — 通过 `opencrust skill install <url>` 从任意公共 hub 安装社区技能；flat（`skill-name.md`）与 folder（`skill-name/SKILL.md`）两种格式可同时共存，无需迁移
+- **安全扫描** — 每个技能在安装前均会扫描 prompt 注入风险，无论来源是 URL、本地文件还是 agent 自创
+- **Agent 可编辑技能** — agent 可通过 `patch` 更新已有技能的 body、description 或 triggers，并通过 `write_file` 在技能目录中添加补充 `.md` 文件
 
 ### 多智能体编排
 
@@ -331,8 +407,8 @@ guardrails:
 
 gateway:
   rate_limit:
-    max_messages_per_minute: 10     # 每用户每分钟消息数限制
-    cooldown_seconds: 30            # 超限后的冷却时间
+    per_user_per_minute: 10         # 每用户每分钟消息数限制
+    cooldown_secs: 30               # 超限后的冷却时间
 
 memory:
   enabled: true

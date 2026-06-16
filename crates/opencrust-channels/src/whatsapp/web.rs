@@ -24,12 +24,17 @@ type SharedStdinTx = Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>;
 /// Lightweight send-only handle for WhatsApp Web.
 pub struct WhatsAppWebSender {
     shared_stdin_tx: SharedStdinTx,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for WhatsAppWebSender {
     fn channel_type(&self) -> &str {
         "whatsapp-web"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -47,6 +52,7 @@ pub struct WhatsAppWebChannel {
     stdin_tx: Option<mpsc::Sender<String>>,
     /// Shared sender handle exposed via `create_sender()`.
     shared_stdin_tx: SharedStdinTx,
+    name: String,
     status: ChannelStatus,
     display: String,
     on_message: WhatsAppOnMessageFn,
@@ -71,6 +77,7 @@ impl WhatsAppWebChannel {
             child: None,
             stdin_tx: None,
             shared_stdin_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            name: "whatsapp-web".to_string(),
             status: ChannelStatus::Disconnected,
             display: "WhatsApp Web".to_string(),
             on_message,
@@ -78,6 +85,12 @@ impl WhatsAppWebChannel {
             auth_dir: config_dir.join("whatsapp-web-auth"),
             sidecar_dir: config_dir.join("sidecar").join("whatsapp-web"),
         }
+    }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     // Embedded sidecar files - written to disk on first connect if not found elsewhere.
@@ -178,6 +191,7 @@ impl ChannelLifecycle for WhatsAppWebChannel {
     fn create_sender(&self) -> Box<dyn ChannelSender> {
         Box::new(WhatsAppWebSender {
             shared_stdin_tx: Arc::clone(&self.shared_stdin_tx),
+            name: self.name.clone(),
         })
     }
 
@@ -389,6 +403,10 @@ impl ChannelLifecycle for WhatsAppWebChannel {
 impl ChannelSender for WhatsAppWebChannel {
     fn channel_type(&self) -> &str {
         "whatsapp-web"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

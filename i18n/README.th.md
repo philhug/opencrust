@@ -68,29 +68,62 @@ cargo build --release --features plugins
 ```
 </details>
 
+### Web Chat
+
+เมื่อ gateway รันแล้ว เปิดเบราว์เซอร์ที่:
+
+```
+http://127.0.0.1:3888
+```
+
+Web UI ในตัวช่วยให้คุณแชทกับ agent สลับ LLM provider, จัดการ MCP server และตรวจสอบ channel ที่เชื่อมต่ออยู่ — โดยไม่ต้องรีสตาร์ท
+
+> **Authentication** — ถ้าตั้งค่า `api_key` ไว้ใน `config.yml` UI จะขอ gateway key ก่อนเชื่อมต่อ
+
+### แชทผ่าน Terminal
+
+คุยกับ agent โดยตรงจาก terminal โดยไม่ต้องเปิดเบราว์เซอร์
+
+> **ต้องเปิด gateway ก่อน** รัน `opencrust init` (ครั้งแรกเท่านั้น) จากนั้น `opencrust start` ก่อนใช้ `opencrust chat`
+
+```bash
+# ตั้งค่าครั้งแรก
+opencrust init
+opencrust start           # หรือ: opencrust start -d  (daemon mode)
+
+# เปิด terminal chat
+opencrust chat
+opencrust chat --agent coder           # เริ่มด้วย agent ที่กำหนด
+opencrust chat --url http://host:3888  # เชื่อมกับ gateway อื่น
+```
+
+<img src="../assets/demo.gif" alt="OpenCrust terminal chat demo" width="720">
+
+**คำสั่งใน chat:** `/help` · `/new` (เริ่ม session ใหม่) · `/agent <id>` · `/clear` · `/exit`
+
 binary สำหรับ Linux (x86_64, aarch64), macOS (Intel, Apple Silicon) และ Windows (x86_64) ดาวน์โหลดได้ที่ [GitHub Releases](https://github.com/opencrust-org/opencrust/releases)
 
 ## ทำไมต้อง OpenCrust?
 
-### เทียบกับ OpenClaw, ZeroClaw และเฟรมเวิร์คอื่น
-
-| | **OpenCrust** | **OpenClaw** (Node.js) | **ZeroClaw** (Rust) |
-|---|---|---|---|
-| **ขนาด binary** | 16 MB | ~1.2 GB (รวม node_modules) | ~25 MB |
-| **RAM ขณะ idle** | 13 MB | ~388 MB | ~20 MB |
-| **Cold start** | 3 ms | 13.9 s | ~50 ms |
-| **เก็บ credential** | vault เข้ารหัส AES-256-GCM | plaintext config file | plaintext config file |
-| **Auth ค่าเริ่มต้น** | เปิดใช้ (WebSocket pairing) | ปิดใช้ | ปิดใช้ |
-| **Scheduling** | Cron, interval, one-shot | ใช่ | ไม่ |
-| **Multi-agent routing** | ใช่ (named agents) | ใช่ (agentId) | ไม่ |
-| **Session orchestration** | ใช่ | ใช่ | ไม่ |
-| **MCP support** | Stdio + HTTP | Stdio + HTTP | Stdio |
-| **ช่องทาง** | 9 | 6+ | 4 |
-| **LLM provider** | 15 | 10+ | 22+ |
-| **Pre-compiled binary** | ใช่ | N/A (Node.js) | Build จาก source |
-| **Config hot-reload** | ใช่ | ไม่ | ไม่ |
-| **WASM plugin system** | Optional (sandboxed) | ไม่ | ไม่ |
-| **Self-update** | ใช่ (`opencrust update`) | npm | Build จาก source |
+| | |
+|---|---|
+| **ขนาด binary** | 16 MB single binary |
+| **RAM ขณะ idle** | 13 MB |
+| **Cold start** | 3 ms |
+| **เก็บ credential** | vault เข้ารหัส AES-256-GCM |
+| **Auth ค่าเริ่มต้น** | เปิดใช้ (WebSocket pairing) |
+| **Scheduling** | Cron, interval, one-shot |
+| **Multi-agent routing** | ใช่ (named agents) |
+| **Session orchestration** | ใช่ |
+| **MCP support** | Stdio + HTTP |
+| **ช่องทาง** | 9 |
+| **LLM provider** | 15 |
+| **Pre-compiled binary** | ใช่ |
+| **Config hot-reload** | ใช่ |
+| **Plugin system** | WASM (sandboxed) |
+| **Self-update** | ใช่ (`opencrust update`) |
+| **Security scan** | ✅ ตรวจ prompt-injection ทุก skill ก่อนติดตั้ง |
+| **Self-improvement** | ✅ cross-session patterns, skill lifecycle, confidence gate |
 
 *วัดผลบน DigitalOcean droplet 1 vCPU, 1 GB RAM [ทดสอบเองได้](../bench/)*
 
@@ -174,14 +207,57 @@ OpenCrust ถูกออกแบบสำหรับ AI agent ที่ทำ
 - จัดการ context window — สรุปบทสนทนาแบบ rolling ที่ 75% ของ context window
 - Scheduled task — cron, interval และ one-shot scheduling
 
+### Document RAG
+
+นำเข้าเอกสารเข้าสู่ฐานความรู้ของ agent — agent จะดึงและอ้างอิงตอนที่เกี่ยวข้องโดยอัตโนมัติเมื่อตอบคำถาม โดยไม่ต้องสั่งเพิ่มเติม
+
+**นำเข้าเอกสาร:**
+
+ส่งไฟล์ไปยัง channel ใดก็ได้ แล้วพิมพ์ `!ingest` เพื่อบันทึก ใช้ `!ingest replace` เพื่อแทนที่เวอร์ชันที่มีอยู่
+
+```bash
+# ผ่าน REST API
+curl -X POST http://localhost:8080/api/ingest \
+  -F "file=@report.pdf" \
+  -F "session_id=default"
+```
+
+**ประเภทไฟล์ที่รองรับ:** PDF, Markdown, plain text, CSV, JSON, HTML และ source code (`.rs`, `.py`, `.js`, `.ts`, `.go`, `.java`, `.toml`, `.yaml`)
+
+**การทำงาน:**
+
+1. เอกสารถูกแบ่งเป็น chunk และเก็บใน SQLite (`~/.opencrust/data/documents.db`)
+2. แต่ละ chunk ถูก embed ผ่าน embedding provider ที่ตั้งค่าไว้ (Cohere เป็นค่าเริ่มต้น)
+3. ทุกข้อความ จะมีการค้นหาแบบ **hybrid** (vector + keyword, top 3 chunk, similarity threshold 0.42) อัตโนมัติ
+4. Chunk ที่ตรงจะถูก inject เข้าในข้อความของผู้ใช้ก่อนที่ LLM จะเห็น
+5. Agent อ้างอิงชื่อเอกสารต้นทางและ relevance score ในคำตอบ
+
+**ค้นหาด้วยตัวเอง:**
+
+ใช้ tool `doc_search` โดยตรง: `doc_search("annual report revenue")`
+
+**Embedding provider (ไม่บังคับ):**
+
+หากไม่มี embedding provider RAG จะ fallback เป็นการค้นหาแบบ keyword อย่างเดียว เพิ่ม Cohere ใน `config.yml` เพื่อใช้ semantic (vector) retrieval:
+
+```yaml
+embeddings:
+  provider: cohere
+  api_key: your-cohere-key
+```
+
 ### Skills
 - กำหนด agent skill เป็นไฟล์ Markdown (SKILL.md) พร้อม YAML frontmatter
 - auto-discovery จาก `~/.opencrust/skills/` — inject เข้า system prompt อัตโนมัติ
 - Hot-reload — skill พร้อมใช้ทันทีหลัง `create_skill` หรือ `skill install` โดยไม่ต้อง restart
 - CLI: `opencrust skill list`, `opencrust skill install <url|path>`, `opencrust skill remove <name>`
-- **Self-learning** — agent พิจารณา save workflow ที่นำกลับมาใช้ได้โดยอัตโนมัติหลังใช้ tool ≥ 3 ครั้ง โดย nudge จะปรากฏต่อท้าย response
+- **Self-learning & self-improvement** — agent ติดตาม tool-call pattern ข้ามหลาย session; เมื่อ workflow ซ้ำกัน 5 ครั้งขึ้นไปจะ save เป็น skill อัตโนมัติ (rate-limited เพื่อลด noise); เมื่อนำ skill ที่มีอยู่มาใช้ agent จะประเมินตัวเองและ patch อัตโนมัติหากพบช่องว่าง (ต้องผ่าน confidence gate ก่อน patch; version จะ bump และ CHANGELOG.md อัพเดตทุกครั้งที่ patch)
+- **Automatic skill lifecycle** — skill ที่ไม่ได้ใช้งานนานกว่า 30 วันจะถูก archive อัตโนมัติ (เปลี่ยนชื่อเป็น `<name>.archived`); ข้อมูล trajectory ที่เก่ากว่า 90 วันจะถูก compress ทุกวันโดย LLM โดยยังเก็บ skill candidate ไว้สำหรับ pattern detection ต่อไป
 - ปิดได้ด้วย `agent.self_learning: false` ใน `config.yml`
 - Quality control 3 ชั้น: prompt guidance, mechanical limits (สูงสุด 30 skills, min body length, duplicate guard) และ `rationale` บังคับที่เก็บไว้ใน skill file เพื่อตรวจสอบได้
+- **รองรับ [agentskills.io](https://agentskills.io)** — ติดตั้ง community skill จาก hub สาธารณะใดก็ได้ด้วย `opencrust skill install <url>` รองรับทั้ง flat (`skill-name.md`) และ folder (`skill-name/SKILL.md`) layout พร้อมกันโดยไม่ต้อง migrate
+- **Security scan** — ทุก skill ถูกตรวจหา prompt-injection ก่อน install ไม่ว่าจะมาจาก URL, ไฟล์ local หรือ agent สร้างเอง
+- **Agent แก้ไข skill ได้** — agent สามารถ `patch` skill ที่มีอยู่ (แก้ body, description หรือ triggers) และ `write_file` เพื่อเพิ่มไฟล์ `.md` เสริมใน skill folder
 
 ### Multi-Agent Orchestration
 
@@ -336,8 +412,8 @@ guardrails:
 
 gateway:
   rate_limit:
-    max_messages_per_minute: 10     # จำกัด message ต่อผู้ใช้ต่อนาที
-    cooldown_seconds: 30            # cooldown หลังเกินขีดจำกัด
+    per_user_per_minute: 10         # จำกัด message ต่อผู้ใช้ต่อนาที
+    cooldown_secs: 30               # cooldown หลังเกินขีดจำกัด
 
 memory:
   enabled: true

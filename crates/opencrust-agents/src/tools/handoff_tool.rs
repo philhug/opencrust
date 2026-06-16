@@ -181,3 +181,210 @@ impl Tool for HandoffTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentRuntime;
+    use crate::providers::{ContentBlock, LlmProvider, LlmRequest, LlmResponse};
+    use opencrust_config::NamedAgentConfig;
+    use std::collections::HashMap;
+
+    // A provider that always returns a fixed text reply.
+    struct FixedProvider {
+        reply: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FixedProvider {
+        fn provider_id(&self) -> &str {
+            "fixed"
+        }
+
+        async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.reply.to_string(),
+                }],
+                model: String::new(),
+                usage: None,
+                stop_reason: None,
+            })
+        }
+
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Build an `Arc<AgentRuntime>` with a wired `HandoffTool` and a `FixedProvider`.
+    /// `agents` is inserted into `AppConfig` so the tool can resolve agent IDs.
+    fn make_wired_runtime(
+        reply: &'static str,
+        agents: HashMap<String, NamedAgentConfig>,
+    ) -> Arc<AgentRuntime> {
+        let config = Arc::new(RwLock::new(AppConfig {
+            agents,
+            ..Default::default()
+        }));
+        let (tool, handle) = HandoffTool::new(Arc::clone(&config));
+        let mut runtime = AgentRuntime::new();
+        runtime.register_tool(Box::new(tool));
+        runtime.register_provider(Arc::new(FixedProvider { reply }));
+        let runtime = Arc::new(runtime);
+        handle.wire(&runtime);
+        runtime
+    }
+
+    fn ctx(depth: u8) -> ToolContext {
+        ToolContext {
+            session_id: "test-session".to_string(),
+            user_id: None,
+            heartbeat_depth: depth,
+            allowed_tools: None,
+        }
+    }
+
+    // ── 1. Missing agent_id ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn missing_agent_id_returns_error() {
+        let runtime = make_wired_runtime("hi", HashMap::new());
+        let tool = HandoffTool::new(Arc::new(RwLock::new(AppConfig::default()))).0;
+        // Execute directly on an unwired tool is fine here — parameter check
+        // happens before the runtime is consulted.
+        let out = tool
+            .execute(&ctx(0), serde_json::json!({ "message": "do something" }))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("agent_id"), "got: {}", out.content);
+        // ensure the runtime is kept alive
+        drop(runtime);
+    }
+
+    // ── 2. Missing message ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn missing_message_returns_error() {
+        let tool = HandoffTool::new(Arc::new(RwLock::new(AppConfig::default()))).0;
+        let out = tool
+            .execute(&ctx(0), serde_json::json!({ "agent_id": "coder" }))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("message"), "got: {}", out.content);
+    }
+
+    // ── 3. Depth limit ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn depth_limit_returns_error() {
+        let runtime = make_wired_runtime("reply", HashMap::new());
+        // Grab the HandoffTool out of the runtime by re-creating one wired to the same runtime.
+        // We test via a fresh tool wired to the same Arc so the runtime stays alive.
+        let config = Arc::new(RwLock::new(AppConfig::default()));
+        let (tool, handle) = HandoffTool::new(Arc::clone(&config));
+        handle.wire(&runtime);
+
+        let out = tool
+            .execute(
+                &ctx(MAX_HANDOFF_DEPTH), // depth == limit → reject
+                serde_json::json!({ "agent_id": "any", "message": "hi" }),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("depth limit"), "got: {}", out.content);
+    }
+
+    // ── 4. Unknown agent ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_agent_returns_error() {
+        // No agents registered in config.
+        let runtime = make_wired_runtime("reply", HashMap::new());
+        let config = Arc::new(RwLock::new(AppConfig::default()));
+        let (tool, handle) = HandoffTool::new(Arc::clone(&config));
+        handle.wire(&runtime);
+
+        let out = tool
+            .execute(
+                &ctx(0),
+                serde_json::json!({ "agent_id": "ghost", "message": "help" }),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("ghost"),
+            "error should name the unknown agent, got: {}",
+            out.content
+        );
+    }
+
+    // ── 5. Happy path ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn successful_handoff_returns_specialist_response() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            NamedAgentConfig {
+                provider: None,
+                model: None,
+                system_prompt: Some("You are a coding expert.".to_string()),
+                max_tokens: None,
+                max_context_tokens: None,
+                tools: vec![],
+                dna_file: None,
+                skills_dir: None,
+            },
+        );
+
+        let runtime = make_wired_runtime("fn main() {}", agents.clone());
+        let config = Arc::new(RwLock::new(AppConfig {
+            agents,
+            ..Default::default()
+        }));
+        let (tool, handle) = HandoffTool::new(Arc::clone(&config));
+        handle.wire(&runtime);
+
+        let out = tool
+            .execute(
+                &ctx(0),
+                serde_json::json!({
+                    "agent_id": "coder",
+                    "message": "write hello world in Rust"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.is_error,
+            "expected success, got error: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("coder"),
+            "response should be prefixed with agent id, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("fn main()"),
+            "response should include provider reply, got: {}",
+            out.content
+        );
+    }
+
+    // ── wire() called twice is harmless ──────────────────────────────────────
+
+    #[test]
+    fn wire_twice_is_idempotent() {
+        let config = Arc::new(RwLock::new(AppConfig::default()));
+        let (_tool, handle) = HandoffTool::new(config);
+        let runtime = Arc::new(AgentRuntime::new());
+        handle.wire(&runtime);
+        handle.wire(&runtime); // second call must not panic
+    }
+}

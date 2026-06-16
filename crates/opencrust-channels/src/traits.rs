@@ -56,8 +56,19 @@ pub trait ChannelLifecycle: Send {
 /// Designed to be wrapped in `Arc` and shared across tasks (e.g. the scheduler).
 #[async_trait]
 pub trait ChannelSender: Send + Sync {
-    /// Unique identifier for this channel type.
+    /// Unique identifier for this channel type (e.g. `"discord"`, `"telegram"`).
     fn channel_type(&self) -> &str;
+
+    /// Config key name for this sender instance (e.g. `"discord-support"`).
+    ///
+    /// Used as the key when registering senders in the gateway's `channel_senders`
+    /// map, so multiple instances of the same channel type can coexist without
+    /// key collision.
+    ///
+    /// Defaults to [`channel_type()`][Self::channel_type] for backward compatibility.
+    fn channel_name(&self) -> &str {
+        self.channel_type()
+    }
 
     /// Send a message through this channel.
     async fn send_message(&self, message: &Message) -> Result<()>;
@@ -111,5 +122,25 @@ mod tests {
             audio: vec![],
         };
         assert_eq!(r.text(), "words");
+    }
+
+    /// Verify the default `channel_name()` falls back to `channel_type()`.
+    #[tokio::test]
+    async fn channel_name_default_returns_channel_type() {
+        struct MinimalSender;
+        #[async_trait::async_trait]
+        impl ChannelSender for MinimalSender {
+            fn channel_type(&self) -> &str {
+                "test-type"
+            }
+            async fn send_message(
+                &self,
+                _msg: &opencrust_common::Message,
+            ) -> opencrust_common::Result<()> {
+                Ok(())
+            }
+        }
+        let s = MinimalSender;
+        assert_eq!(s.channel_name(), "test-type");
     }
 }

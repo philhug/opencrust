@@ -2,9 +2,62 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use opencrust_common::{Error, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::model::{AppConfig, McpServerConfig};
+
+/// Maximum number of backup copies to keep per config file.
+const MAX_BACKUPS: u32 = 3;
+
+/// Create a rotated backup of `path` before it is overwritten.
+///
+/// Backup chain: `file.bak.3` is removed, `file.bak.2` becomes
+/// `file.bak.3`, `file.bak.1` becomes `file.bak.2`, and the current file is
+/// copied to `file.bak.1`.
+///
+/// Does nothing when `path` does not exist yet.
+pub fn backup_file(path: &Path) -> std::io::Result<()> {
+    backup_file_with_limit(path, MAX_BACKUPS)
+}
+
+/// Like [`backup_file`] but with a configurable retention limit.
+pub fn backup_file_with_limit(path: &Path, max_backups: u32) -> std::io::Result<()> {
+    if !path.exists() || max_backups == 0 {
+        return Ok(());
+    }
+
+    let oldest = backup_path(path, max_backups);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+
+    for i in (1..max_backups).rev() {
+        let from = backup_path(path, i);
+        let to = backup_path(path, i + 1);
+        if from.exists() {
+            std::fs::rename(&from, &to)?;
+        }
+    }
+
+    let dest = backup_path(path, 1);
+    std::fs::copy(path, &dest)?;
+    info!("backed up {} -> {}", path.display(), dest.display());
+
+    Ok(())
+}
+
+/// Convenience wrapper that warns instead of failing the caller.
+pub fn try_backup_file(path: &Path) {
+    if let Err(e) = backup_file(path) {
+        warn!("failed to back up {}: {e}", path.display());
+    }
+}
+
+fn backup_path(original: &Path, n: u32) -> PathBuf {
+    let mut name = original.as_os_str().to_os_string();
+    name.push(format!(".bak.{n}"));
+    PathBuf::from(name)
+}
 
 pub struct ConfigLoader {
     config_dir: PathBuf,
@@ -296,6 +349,47 @@ mod tests {
         assert!(dir.join("plugins").exists());
         assert!(dir.join("skills").exists());
         assert!(dir.join("data").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backup_file_rotates_existing_config_backups() {
+        let dir = temp_dir("backup-rotation");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let config = dir.join("config.yml");
+
+        for version in 1..=4 {
+            fs::write(&config, format!("v{version}")).expect("failed to write config");
+            super::backup_file(&config).expect("backup should succeed");
+        }
+
+        assert_eq!(
+            fs::read_to_string(dir.join("config.yml.bak.1")).unwrap(),
+            "v4"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("config.yml.bak.2")).unwrap(),
+            "v3"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("config.yml.bak.3")).unwrap(),
+            "v2"
+        );
+        assert!(!dir.join("config.yml.bak.4").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn try_backup_file_does_not_create_backup_for_missing_config() {
+        let dir = temp_dir("backup-missing");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let config = dir.join("config.yml");
+
+        super::try_backup_file(&config);
+
+        assert!(!dir.join("config.yml.bak.1").exists());
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -79,6 +79,10 @@ impl ChannelSender for MqttSender {
         "mqtt"
     }
 
+    fn channel_name(&self) -> &str {
+        &self.channel_name
+    }
+
     async fn send_message(&self, message: &Message) -> Result<()> {
         let topic = message
             .metadata
@@ -178,6 +182,10 @@ impl ChannelLifecycle for MqttChannel {
 impl ChannelSender for MqttChannel {
     fn channel_type(&self) -> &str {
         "mqtt"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.config.channel_name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {

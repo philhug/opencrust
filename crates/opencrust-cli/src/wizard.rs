@@ -1800,6 +1800,7 @@ pub async fn run_wizard(config_dir: &Path) -> Result<()> {
 
     // Write config
     let config_path = config_dir.join("config.yml");
+    opencrust_config::try_backup_file(&config_path);
     let yaml = serde_yaml::to_string(&config).context("failed to serialize config")?;
     std::fs::write(&config_path, &yaml)
         .context(format!("failed to write {}", config_path.display()))?;
@@ -2121,6 +2122,7 @@ pub async fn run_mcp_add_wizard(config_dir: &Path, pre_selected: Option<&str>) -
 
     // --- Save config ---
     config.mcp.insert(server_name.clone(), mcp_config);
+    opencrust_config::try_backup_file(&config_path);
     let yaml = serde_yaml::to_string(&config).context("failed to serialize config")?;
     std::fs::write(&config_path, &yaml)
         .context(format!("failed to write {}", config_path.display()))?;
@@ -2403,6 +2405,7 @@ pub fn run_mcp_remove(config_dir: &Path, config: &AppConfig, name: &str) -> Resu
         }
     }
 
+    opencrust_config::try_backup_file(&config_path);
     let yaml = serde_yaml::to_string(&config).context("failed to serialize config")?;
     std::fs::write(&config_path, &yaml)
         .context(format!("failed to write {}", config_path.display()))?;

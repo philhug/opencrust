@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 use opencrust_agents::tools::Tool;
 use opencrust_agents::{
     AgentRuntime, AnthropicProvider, BashTool, ChatMessage, CohereEmbeddingProvider,
-    CreateSkillTool, DocSearchTool, FileReadTool, FileWriteTool, GoogleSearchTool, McpManager,
-    OllamaEmbeddingProvider, OllamaProvider, OpenAiProvider, WebFetchTool, WebSearchTool,
+    CreateSkillTool, DocSearchTool, FilePatchTool, FileReadTool, FileWriteTool, GoogleSearchTool,
+    ListDocumentsTool, McpManager, MemoryTool, OllamaEmbeddingProvider, OllamaProvider,
+    OpenAiProvider, SearchFilesTool, SendMessageHandle, SendMessageTool, WebFetchTool,
+    WebSearchTool,
 };
 use opencrust_channels::{
     ChannelResponse, MediaAttachment, MqttChannel, MqttOnMessageFn, SlackChannel, SlackGroupFilter,
@@ -16,7 +18,7 @@ use opencrust_channels::{
 #[cfg(target_os = "macos")]
 use opencrust_channels::{IMessageChannel, IMessageGroupFilter, IMessageOnMessageFn};
 use opencrust_config::AppConfig;
-use opencrust_db::MemoryStore;
+use opencrust_db::{MemoryStore, TrajectoryStore, VectorStore};
 use opencrust_security::{Allowlist, ChannelPolicy, DmAuthResult, PairingManager, check_dm_auth};
 use tracing::{info, warn};
 
@@ -29,10 +31,6 @@ pub(crate) fn default_vault_path() -> Option<PathBuf> {
             .join("credentials")
             .join("vault.json"),
     )
-}
-
-fn default_allowlist_path() -> PathBuf {
-    opencrust_config::ConfigLoader::default_config_dir().join("allowlist.json")
 }
 
 /// Resolve an API key using the priority chain: vault -> config -> env var.
@@ -60,7 +58,7 @@ pub(crate) fn resolve_api_key(
 }
 
 /// Build a fully-configured `AgentRuntime` from the application config.
-pub async fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
+pub async fn build_agent_runtime(config: &AppConfig) -> (AgentRuntime, SendMessageHandle) {
     let mut runtime = AgentRuntime::new();
 
     // --- LLM Providers ---
@@ -415,6 +413,8 @@ pub async fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
     runtime.register_tool(Box::new(BashTool::new(None)));
     runtime.register_tool(Box::new(FileReadTool::new(None)));
     runtime.register_tool(Box::new(FileWriteTool::new(None)));
+    runtime.register_tool(Box::new(FilePatchTool::new(None)));
+    runtime.register_tool(Box::new(SearchFilesTool::new()));
     runtime.register_tool(Box::new(WebFetchTool::new(None)));
 
     // Self-learning: agent can save reusable skills discovered during conversations.
@@ -545,10 +545,11 @@ pub async fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
             .unwrap_or_else(|| opencrust_config::ConfigLoader::default_config_dir().join("data"));
         let memory_db_path = data_dir.join("memory.db");
 
-        // Register doc_search whenever the memory DB exists — documents ingested
-        // after startup are visible because the tool opens the DB fresh per call.
+        // Always register doc_search — the tool opens the DB fresh on every call,
+        // so documents ingested after startup (including the very first ingest) are
+        // immediately visible without a server restart.
         // Embedding is optional: falls back to keyword search when unavailable.
-        if memory_db_path.exists() {
+        {
             let embed_fn: Option<opencrust_agents::tools::doc_search_tool::EmbedFn> =
                 runtime.embedding_provider().map(|embed| {
                     let embed_clone = embed.clone();
@@ -571,8 +572,19 @@ pub async fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
             )));
             runtime.set_doc_db_path(memory_db_path.clone());
             info!("doc_search tool registered ({mode} search)");
+            runtime.register_tool(Box::new(ListDocumentsTool::new(memory_db_path.clone())));
+            info!("list_documents tool registered");
+
+            // Explicit persistent memory tool — agent-initiated save/recall across sessions.
+            runtime.register_tool(Box::new(MemoryTool::new(memory_db_path.clone())));
+            info!("memory tool registered");
         }
     }
+
+    // --- send_message tool (wired via handle returned to caller) ---
+    let (send_msg_tool, send_msg_handle) = SendMessageTool::new();
+    runtime.register_tool(Box::new(send_msg_tool));
+    info!("send_message tool registered (wire via SendMessageHandle before use)");
 
     // --- Agent Config ---
     if let Some(prompt) = &config.agent.system_prompt {
@@ -596,6 +608,20 @@ pub async fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
     }
     if let Some(limit) = config.agent.skill_recall_limit {
         runtime.set_skill_recall_limit(limit);
+    }
+    if config.agent.collect_trajectories.unwrap_or(false) {
+        let traj_dir = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| opencrust_config::ConfigLoader::default_config_dir().join("data"));
+        let traj_path = traj_dir.join("trajectories.db");
+        match TrajectoryStore::open(&traj_path) {
+            Ok(store) => {
+                runtime.set_trajectory_store(Arc::new(store));
+                info!("trajectory store opened at {}", traj_path.display());
+            }
+            Err(e) => warn!("failed to open trajectory store: {e}"),
+        }
     }
 
     // --- Skills ---
@@ -624,7 +650,7 @@ pub async fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
         Err(e) => warn!("failed to read dna.md: {e}"),
     }
 
-    runtime
+    (runtime, send_msg_handle)
 }
 
 /// Resolve MCP server env vars through the vault. Empty values trigger a
@@ -871,12 +897,8 @@ pub fn build_discord_channels(
             settings.insert("application_id".to_string(), serde_json::json!(id));
         }
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
+        let pairing = Arc::clone(&state.pairing);
 
         let policy = Arc::new(ChannelPolicy::from_settings(&settings));
 
@@ -935,53 +957,14 @@ pub fn build_discord_channels(
                         let cmd_word = cmd.split_whitespace().next().unwrap_or("");
                         if cmd_word == "ingest" {
                             if let Some(pending) = state.take_pending_file(&session_id) {
-                                let doc_store =
-                                    opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                        .map_err(|e| {
-                                            format!("failed to open document store: {e}")
-                                        })?;
-                                let embed = state.agents.embedding_provider();
-                                let replace = text.to_lowercase().contains("replace");
-                                return match crate::ingest::ingest_from_bytes(
+                                return crate::ingest::run_ingest(
+                                    &state,
+                                    &data_dir,
+                                    &text,
                                     &pending.filename,
                                     &pending.data,
-                                    &doc_store,
-                                    embed.as_deref(),
-                                    replace,
                                 )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let action = if result.replaced {
-                                            "Replaced"
-                                        } else {
-                                            "Ingested"
-                                        };
-                                        let embed_note = if result.has_embeddings {
-                                            " with embeddings"
-                                        } else {
-                                            ""
-                                        };
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{action} {} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                            pending.filename, result.chunk_count
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("already ingested") {
-                                            Ok(ChannelResponse::Text(format!(
-                                                "{} is already ingested. Use !ingest replace to update it.",
-                                                pending.filename
-                                            )))
-                                        } else {
-                                            Err(format!(
-                                                "Failed to ingest {}: {msg}",
-                                                pending.filename
-                                            ))
-                                        }
-                                    }
-                                };
+                                .await;
                             } else {
                                 return Ok(ChannelResponse::Text(
                                     "No pending file. Send a document first, then use !ingest."
@@ -1009,48 +992,15 @@ pub fn build_discord_channels(
                         let fname = discord_file.filename.clone();
                         let caption = text.trim().to_lowercase();
                         if caption.contains("ingest") {
-                            let doc_store =
-                                opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                    .map_err(|e| format!("failed to open document store: {e}"))?;
-                            let embed = state.agents.embedding_provider();
-                            let replace = caption.contains("replace");
-                            return match crate::ingest::ingest_from_bytes(
+                            return crate::ingest::run_ingest(
+                                &state,
+                                &data_dir,
+                                &caption,
                                 &fname,
                                 &discord_file.data,
-                                &doc_store,
-                                embed.as_deref(),
-                                replace,
                             )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let action = if result.replaced {
-                                        "Replaced"
-                                    } else {
-                                        "Ingested"
-                                    };
-                                    let embed_note = if result.has_embeddings {
-                                        " with embeddings"
-                                    } else {
-                                        ""
-                                    };
-                                    Ok(ChannelResponse::Text(format!(
-                                        "{action} {fname} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                        result.chunk_count
-                                    )))
-                                }
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    if msg.contains("already ingested") {
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{fname} is already ingested. Send it again with caption \"ingest replace\" to update it."
-                                        )))
-                                    } else {
-                                        Err(format!("Failed to ingest {fname}: {msg}"))
-                                    }
-                                }
-                            };
-                        } else {
+                            .await;
+                        } else if opencrust_media::is_supported_for_ingest(&fname) {
                             state.set_pending_file(
                                 &session_id,
                                 crate::state::PendingFile {
@@ -1191,7 +1141,8 @@ pub fn build_discord_channels(
                     discord_config,
                     on_message,
                     group_filter,
-                );
+                )
+                .with_name(name.clone());
                 channels.push(Box::new(channel) as Box<dyn opencrust_channels::Channel>);
                 info!("configured discord channel: {name}");
             }
@@ -1339,13 +1290,9 @@ pub fn build_telegram_channels(
             continue;
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
 
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let pairing = Arc::clone(&state.pairing);
 
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
@@ -1418,55 +1365,14 @@ pub fn build_telegram_channels(
                         if cmd == "ingest" {
                             let session_id = format!("telegram-{chat_id}");
                             if let Some(pending) = state.take_pending_file(&session_id) {
-                                let doc_store =
-                                    opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                        .map_err(|e| {
-                                            format!("failed to open document store: {e}")
-                                        })?;
-
-                                let embed = state.agents.embedding_provider();
-                                let replace = text.to_lowercase().contains("replace");
-
-                                return match crate::ingest::ingest_from_bytes(
+                                return crate::ingest::run_ingest(
+                                    &state,
+                                    &data_dir,
+                                    &text,
                                     &pending.filename,
                                     &pending.data,
-                                    &doc_store,
-                                    embed.as_deref(),
-                                    replace,
                                 )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let action = if result.replaced {
-                                            "Replaced"
-                                        } else {
-                                            "Ingested"
-                                        };
-                                        let embed_note = if result.has_embeddings {
-                                            " with embeddings"
-                                        } else {
-                                            ""
-                                        };
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{action} {} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                            pending.filename, result.chunk_count
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("already ingested") {
-                                            Ok(ChannelResponse::Text(format!(
-                                                "{} is already ingested. Use !ingest replace to update it.",
-                                                pending.filename
-                                            )))
-                                        } else {
-                                            Err(format!(
-                                                "Failed to ingest {}: {msg}",
-                                                pending.filename
-                                            ))
-                                        }
-                                    }
-                                };
+                                .await;
                             } else {
                                 return Ok(ChannelResponse::Text(
                                     "No pending file. Send a document first, then use !ingest."
@@ -1751,52 +1657,15 @@ pub fn build_telegram_channels(
 
                             // If caption contains "ingest", ingest immediately
                             if caption_text.contains("ingest") {
-                                let doc_store =
-                                    opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                        .map_err(|e| {
-                                            format!("failed to open document store: {e}")
-                                        })?;
-
-                                let embed = state.agents.embedding_provider();
-                                let replace = caption_text.contains("replace");
-
-                                match crate::ingest::ingest_from_bytes(
+                                return crate::ingest::run_ingest(
+                                    &state,
+                                    &data_dir,
+                                    &caption_text,
                                     &fname,
                                     &data,
-                                    &doc_store,
-                                    embed.as_deref(),
-                                    replace,
                                 )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let action = if result.replaced {
-                                            "Replaced"
-                                        } else {
-                                            "Ingested"
-                                        };
-                                        let embed_note = if result.has_embeddings {
-                                            " with embeddings"
-                                        } else {
-                                            ""
-                                        };
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{action} {fname} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                            result.chunk_count
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("already ingested") {
-                                            Ok(ChannelResponse::Text(format!(
-                                                "{fname} is already ingested. Send it again with caption \"ingest replace\" to update it."
-                                            )))
-                                        } else {
-                                            Err(format!("Failed to ingest {fname}: {msg}"))
-                                        }
-                                    }
-                                }
-                            } else {
+                                .await;
+                            } else if opencrust_media::is_supported_for_ingest(&fname) {
                                 // Store as pending and prompt
                                 state.set_pending_file(
                                     &session_id,
@@ -1809,6 +1678,8 @@ pub fn build_telegram_channels(
                                 Ok(ChannelResponse::Text(format!(
                                     "Received {fname}. Use !ingest to store it for future reference."
                                 )))
+                            } else {
+                                Ok(ChannelResponse::Text(String::new()))
                             }
                         }
                         None => {
@@ -1902,7 +1773,8 @@ pub fn build_telegram_channels(
             },
         );
 
-        let channel = TelegramChannel::with_group_filter(bot_token, on_message, group_filter);
+        let channel = TelegramChannel::with_group_filter(bot_token, on_message, group_filter)
+            .with_name(name.clone());
         channels.push(Box::new(channel) as Box<dyn opencrust_channels::Channel>);
         info!("configured telegram channel: {name}");
     }
@@ -2183,13 +2055,9 @@ pub fn build_slack_channels(
             continue;
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
 
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let pairing = Arc::clone(&state.pairing);
 
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
@@ -2254,53 +2122,14 @@ pub fn build_slack_channels(
                         let cmd_word = cmd.split_whitespace().next().unwrap_or("");
                         if cmd_word == "ingest" {
                             if let Some(pending) = state.take_pending_file(&session_id) {
-                                let doc_store =
-                                    opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                        .map_err(|e| {
-                                            format!("failed to open document store: {e}")
-                                        })?;
-                                let embed = state.agents.embedding_provider();
-                                let replace = text.to_lowercase().contains("replace");
-                                return match crate::ingest::ingest_from_bytes(
+                                return crate::ingest::run_ingest(
+                                    &state,
+                                    &data_dir,
+                                    &text,
                                     &pending.filename,
                                     &pending.data,
-                                    &doc_store,
-                                    embed.as_deref(),
-                                    replace,
                                 )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let action = if result.replaced {
-                                            "Replaced"
-                                        } else {
-                                            "Ingested"
-                                        };
-                                        let embed_note = if result.has_embeddings {
-                                            " with embeddings"
-                                        } else {
-                                            ""
-                                        };
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{action} {} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                            pending.filename, result.chunk_count
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("already ingested") {
-                                            Ok(ChannelResponse::Text(format!(
-                                                "{} is already ingested. Use !ingest replace to update it.",
-                                                pending.filename
-                                            )))
-                                        } else {
-                                            Err(format!(
-                                                "Failed to ingest {}: {msg}",
-                                                pending.filename
-                                            ))
-                                        }
-                                    }
-                                };
+                                .await;
                             } else {
                                 return Ok(ChannelResponse::Text(
                                     "No pending file. Send a document first, then use !ingest."
@@ -2315,48 +2144,15 @@ pub fn build_slack_channels(
                         let fname = slack_file.filename.clone();
                         let caption = text.trim().to_lowercase();
                         if caption.contains("ingest") {
-                            let doc_store =
-                                opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                    .map_err(|e| format!("failed to open document store: {e}"))?;
-                            let embed = state.agents.embedding_provider();
-                            let replace = caption.contains("replace");
-                            return match crate::ingest::ingest_from_bytes(
+                            return crate::ingest::run_ingest(
+                                &state,
+                                &data_dir,
+                                &caption,
                                 &fname,
                                 &slack_file.data,
-                                &doc_store,
-                                embed.as_deref(),
-                                replace,
                             )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let action = if result.replaced {
-                                        "Replaced"
-                                    } else {
-                                        "Ingested"
-                                    };
-                                    let embed_note = if result.has_embeddings {
-                                        " with embeddings"
-                                    } else {
-                                        ""
-                                    };
-                                    Ok(ChannelResponse::Text(format!(
-                                        "{action} {fname} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                        result.chunk_count
-                                    )))
-                                }
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    if msg.contains("already ingested") {
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{fname} is already ingested. Send it again with caption \"ingest replace\" to update it."
-                                        )))
-                                    } else {
-                                        Err(format!("Failed to ingest {fname}: {msg}"))
-                                    }
-                                }
-                            };
-                        } else {
+                            .await;
+                        } else if opencrust_media::is_supported_for_ingest(&fname) {
                             state.set_pending_file(
                                 &session_id,
                                 crate::state::PendingFile {
@@ -2484,7 +2280,8 @@ pub fn build_slack_channels(
             on_message,
             group_filter,
             bot_user_id,
-        );
+        )
+        .with_name(name.clone());
         channels.push(Box::new(channel) as Box<dyn opencrust_channels::Channel>);
         info!("configured slack channel: {name}");
     }
@@ -2560,13 +2357,9 @@ pub fn build_whatsapp_channels(
             .or_else(|| std::env::var("WHATSAPP_VERIFY_TOKEN").ok())
             .unwrap_or_else(|| "opencrust-verify".to_string());
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
 
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let pairing = Arc::clone(&state.pairing);
 
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
@@ -2629,53 +2422,14 @@ pub fn build_whatsapp_channels(
                         let cmd_word = cmd.split_whitespace().next().unwrap_or("");
                         if cmd_word == "ingest" {
                             if let Some(pending) = state.take_pending_file(&session_id) {
-                                let doc_store =
-                                    opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                        .map_err(|e| {
-                                            format!("failed to open document store: {e}")
-                                        })?;
-                                let embed = state.agents.embedding_provider();
-                                let replace = text.to_lowercase().contains("replace");
-                                return match crate::ingest::ingest_from_bytes(
+                                return crate::ingest::run_ingest(
+                                    &state,
+                                    &data_dir,
+                                    &text,
                                     &pending.filename,
                                     &pending.data,
-                                    &doc_store,
-                                    embed.as_deref(),
-                                    replace,
                                 )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let action = if result.replaced {
-                                            "Replaced"
-                                        } else {
-                                            "Ingested"
-                                        };
-                                        let embed_note = if result.has_embeddings {
-                                            " with embeddings"
-                                        } else {
-                                            ""
-                                        };
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{action} {} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                            pending.filename, result.chunk_count
-                                        )))
-                                    }
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("already ingested") {
-                                            Ok(ChannelResponse::Text(format!(
-                                                "{} is already ingested. Send it again with caption \"ingest replace\" to update it.",
-                                                pending.filename
-                                            )))
-                                        } else {
-                                            Err(format!(
-                                                "Failed to ingest {}: {msg}",
-                                                pending.filename
-                                            ))
-                                        }
-                                    }
-                                };
+                                .await;
                             } else {
                                 return Ok(ChannelResponse::Text(
                                     "No pending file. Send a document first, then use !ingest."
@@ -2690,48 +2444,15 @@ pub fn build_whatsapp_channels(
                         let fname = wa_file.filename.clone();
                         let caption = text.trim().to_lowercase();
                         if caption.contains("ingest") {
-                            let doc_store =
-                                opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                    .map_err(|e| format!("failed to open document store: {e}"))?;
-                            let embed = state.agents.embedding_provider();
-                            let replace = caption.contains("replace");
-                            return match crate::ingest::ingest_from_bytes(
+                            return crate::ingest::run_ingest(
+                                &state,
+                                &data_dir,
+                                &caption,
                                 &fname,
                                 &wa_file.data,
-                                &doc_store,
-                                embed.as_deref(),
-                                replace,
                             )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let action = if result.replaced {
-                                        "Replaced"
-                                    } else {
-                                        "Ingested"
-                                    };
-                                    let embed_note = if result.has_embeddings {
-                                        " with embeddings"
-                                    } else {
-                                        ""
-                                    };
-                                    Ok(ChannelResponse::Text(format!(
-                                        "{action} {fname} ({} chunks{embed_note}). You can now ask me anything about this document.",
-                                        result.chunk_count
-                                    )))
-                                }
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    if msg.contains("already ingested") {
-                                        Ok(ChannelResponse::Text(format!(
-                                            "{fname} is already ingested. Send it again with caption \"ingest replace\" to update it."
-                                        )))
-                                    } else {
-                                        Err(format!("Failed to ingest {fname}: {msg}"))
-                                    }
-                                }
-                            };
-                        } else {
+                            .await;
+                        } else if opencrust_media::is_supported_for_ingest(&fname) {
                             state.set_pending_file(
                                 &session_id,
                                 crate::state::PendingFile {
@@ -2838,13 +2559,9 @@ pub fn build_whatsapp_channels(
             },
         );
 
-        let channel = Arc::new(WhatsAppChannel::new(
-            access_token,
-            phone_number_id,
-            verify_token,
-            on_message,
-        ));
-        channels.push(channel);
+        let channel = WhatsAppChannel::new(access_token, phone_number_id, verify_token, on_message)
+            .with_name(name.clone());
+        channels.push(Arc::new(channel));
         info!("configured whatsapp channel: {name}");
     }
 
@@ -2887,13 +2604,9 @@ pub fn build_whatsapp_web_channels(
             continue;
         }
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
 
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let pairing = Arc::clone(&state.pairing);
 
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
@@ -3056,7 +2769,8 @@ pub fn build_whatsapp_web_channels(
             },
         );
 
-        let channel = WhatsAppWebChannel::with_group_filter(on_message, group_filter);
+        let channel =
+            WhatsAppWebChannel::with_group_filter(on_message, group_filter).with_name(name.clone());
         channels.push(channel);
         info!("configured whatsapp-web channel: {name}");
     }
@@ -3085,13 +2799,9 @@ pub fn build_imessage_channels(
             .and_then(|v| v.as_u64())
             .unwrap_or(2);
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
 
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let pairing = Arc::clone(&state.pairing);
 
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
@@ -3226,7 +2936,8 @@ pub fn build_imessage_channels(
         );
 
         let channel =
-            IMessageChannel::with_group_filter(poll_interval_secs, on_message, group_filter);
+            IMessageChannel::with_group_filter(poll_interval_secs, on_message, group_filter)
+                .with_name(name.clone());
         channels.push(Box::new(channel) as Box<dyn opencrust_channels::Channel>);
         info!("configured imessage channel: {name}");
     }
@@ -3291,12 +3002,8 @@ pub fn build_line_channels(
             _ => Arc::new(|_| true), // "open" — process all group messages
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
+        let pairing = Arc::clone(&state.pairing);
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
         let state_for_cb = Arc::clone(state);
@@ -3336,6 +3043,35 @@ pub fn build_line_channels(
                 let data_dir = data_dir_line.clone();
                 Box::pin(async move {
                     if !is_group {
+                        // Owner-only commands handled before auth so the owner can
+                        // use /pair before their user ID is in the allowlist.
+                        let cmd = text.trim();
+                        if cmd == "/pair" || cmd == "/users" {
+                            let list = allowlist.lock().unwrap();
+                            let is_owner = list.is_owner(&user_id);
+                            drop(list);
+                            if !is_owner {
+                                return Ok(ChannelResponse::Text(
+                                    "Only the bot owner can use this command.".to_string(),
+                                ));
+                            }
+                            if cmd == "/pair" {
+                                let code = pairing.lock().unwrap().generate("line");
+                                return Ok(ChannelResponse::Text(format!(
+                                    "Pairing code: {code}\n\nShare this with the person you want to invite. Valid for 5 minutes."
+                                )));
+                            }
+                            // /users
+                            let list = allowlist.lock().unwrap();
+                            let owner = list.owner().unwrap_or("none").to_string();
+                            let users = list.list_users();
+                            return Ok(ChannelResponse::Text(format!(
+                                "Owner: {owner}\nAllowed users ({}):\n{}",
+                                users.len(),
+                                users.join("\n")
+                            )));
+                        }
+
                         let mut list = allowlist.lock().unwrap();
                         match check_dm_auth(
                             &policy, &mut list, &pairing, &user_id, &user_id, &text, "line",
@@ -3353,47 +3089,78 @@ pub fn build_line_channels(
                         format!("line-{user_id}")
                     };
 
+                    // Post-auth commands available to all allowed users (DM only).
+                    if !is_group {
+                        let cmd = text.trim();
+                        if cmd == "/help" {
+                            let list = allowlist.lock().unwrap();
+                            let is_owner = list.is_owner(&user_id);
+                            drop(list);
+                            let mut help = "OpenCrust Commands:\n\
+                                /help - show this help\n\
+                                /clear - reset conversation history\n\
+                                !ingest - store a sent document for future reference"
+                                .to_string();
+                            if is_owner {
+                                help.push_str(
+                                    "\n/pair - generate a 6-digit invite code\n/users - list allowed users",
+                                );
+                            }
+                            return Ok(ChannelResponse::Text(help));
+                        }
+                        if cmd == "/clear" {
+                            if let Some(mut session) = state.sessions.get_mut(&session_id) {
+                                session.history.clear();
+                            }
+                            state.update_session_summary(&session_id, "");
+                            if let Some(store) = &state.session_store {
+                                let _ = store.prune_old_messages(&session_id, 0);
+                            }
+                            return Ok(ChannelResponse::Text(
+                                "Conversation history cleared.".to_string(),
+                            ));
+                        }
+                    }
+
+                    // Group /clear and !clear — strip @mention prefix then check command.
+                    if is_group {
+                        let raw = text.trim();
+                        let cmd = raw
+                            .strip_prefix(|c: char| c == '@')
+                            .and_then(|s| s.split_once(char::is_whitespace))
+                            .map(|(_, rest)| rest.trim())
+                            .unwrap_or(raw);
+                        if cmd == "/clear" || cmd == "!clear" {
+                            if !allowlist.lock().unwrap().is_allowed(&user_id) {
+                                return Err("__blocked__".to_string());
+                            }
+                            if let Some(mut session) = state.sessions.get_mut(&session_id) {
+                                session.history.clear();
+                            }
+                            state.update_session_summary(&session_id, "");
+                            if let Some(store) = &state.session_store {
+                                let _ = store.prune_old_messages(&session_id, 0);
+                            }
+                            return Ok(ChannelResponse::Text(
+                                "Conversation history cleared.".to_string(),
+                            ));
+                        }
+                    }
+
                     // /ingest — run pending file through the ingestion pipeline.
                     if matches!(text.trim(), "/ingest" | "!ingest")
                         || text.trim().starts_with("/ingest ")
                         || text.trim().starts_with("!ingest ")
                     {
                         if let Some(pending) = state.take_pending_file(&session_id) {
-                            let doc_store =
-                                opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                    .map_err(|e| format!("failed to open document store: {e}"))?;
-                            let embed = state.agents.embedding_provider();
-                            let replace = text.to_lowercase().contains("replace");
-                            return match crate::ingest::ingest_from_bytes(
+                            return crate::ingest::run_ingest(
+                                &state,
+                                &data_dir,
+                                &text,
                                 &pending.filename,
                                 &pending.data,
-                                &doc_store,
-                                embed.as_deref(),
-                                replace,
                             )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let note = if result.has_embeddings {
-                                        String::new()
-                                    } else {
-                                        " (no embedding provider — keyword search only)".to_string()
-                                    };
-                                    Ok(ChannelResponse::Text(format!(
-                                        "Ingested {}: {} chunk(s){}{note}.",
-                                        result.name,
-                                        result.chunk_count,
-                                        if result.replaced {
-                                            ", replaced previous version"
-                                        } else {
-                                            ""
-                                        },
-                                    )))
-                                }
-                                Err(e) => {
-                                    Ok(ChannelResponse::Text(format!("Ingestion failed: {e}")))
-                                }
-                            };
+                            .await;
                         } else {
                             return Ok(ChannelResponse::Text(
                                 "No file pending. Send a document first, then !ingest.".to_string(),
@@ -3404,17 +3171,23 @@ pub fn build_line_channels(
                     // File received — store as pending and prompt the user.
                     if let Some(line_file) = file {
                         let fname = line_file.filename.clone();
-                        state.set_pending_file(
-                            &session_id,
-                            crate::state::PendingFile {
-                                filename: line_file.filename,
-                                data: line_file.data,
-                                received_at: std::time::Instant::now(),
-                            },
-                        );
-                        return Ok(ChannelResponse::Text(format!(
-                            "File received: {fname}. Send !ingest to add it to memory, or !ingest replace to overwrite an existing version."
-                        )));
+                        if opencrust_media::is_supported_for_ingest(&fname) {
+                            state.set_pending_file(
+                                &session_id,
+                                crate::state::PendingFile {
+                                    filename: line_file.filename,
+                                    data: line_file.data,
+                                    received_at: std::time::Instant::now(),
+                                },
+                            );
+                            return Ok(ChannelResponse::Text(format!(
+                                "File received: {fname}. Send !ingest to add it to memory, or !ingest replace to overwrite an existing version."
+                            )));
+                        }
+                        // Unsupported file type (e.g. image) with no accompanying text — stay silent.
+                        if text.trim().is_empty() {
+                            return Ok(ChannelResponse::Text(String::new()));
+                        }
                     }
 
                     state.check_user_rate_limit(&user_id, &rate_limit_config)?;
@@ -3522,12 +3295,284 @@ pub fn build_line_channels(
             },
         );
 
+        // --- Group RAG setup ---
+        // If group_rag_enabled=true and setup succeeds, build a RAG-augmented channel and continue.
+        // On any failure, fall through to build a plain channel without RAG.
+        let group_rag_enabled = channel_config
+            .settings
+            .get("group_rag_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if group_rag_enabled {
+            let embed_provider_name = channel_config
+                .settings
+                .get("embedding_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            let embed_config = config.embeddings.get(embed_provider_name);
+
+            let embed_provider: Option<Arc<dyn opencrust_agents::EmbeddingProvider>> =
+                match embed_config.map(|c| c.provider.as_str()) {
+                    Some("cohere") => {
+                        let api_key = resolve_api_key(
+                            embed_config.and_then(|c| c.api_key.as_deref()),
+                            "COHERE_API_KEY",
+                            "COHERE_API_KEY",
+                        );
+                        api_key.map(|key| {
+                            Arc::new(CohereEmbeddingProvider::new(
+                                key,
+                                embed_config.and_then(|c| c.model.clone()),
+                                embed_config.and_then(|c| c.base_url.clone()),
+                            ))
+                                as Arc<dyn opencrust_agents::EmbeddingProvider>
+                        })
+                    }
+                    _ => {
+                        warn!(
+                            "line channel '{name}': group_rag_enabled=true but no valid embedding_provider configured, skipping RAG"
+                        );
+                        None
+                    }
+                };
+
+            if let Some(provider) = embed_provider {
+                let rag_top_k = channel_config
+                    .settings
+                    .get("rag_top_k")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5) as usize;
+
+                let data_dir = config.data_dir.clone().unwrap_or_else(|| {
+                    opencrust_config::ConfigLoader::default_config_dir().join("data")
+                });
+                let rag_db_path = data_dir.join("group_rag.db");
+
+                match VectorStore::open(&rag_db_path) {
+                    Ok(store) => {
+                        let store = Arc::new(store);
+                        info!("line channel '{name}': group RAG enabled (top_k={rag_top_k})");
+
+                        let observe_store = Arc::clone(&store);
+                        let observe_provider = Arc::clone(&provider);
+                        let observe_fn: opencrust_channels::line::GroupObserveFn =
+                            Arc::new(move |group_id: String, user_id: String, text: String| {
+                                let store = Arc::clone(&observe_store);
+                                let provider = Arc::clone(&observe_provider);
+                                Box::pin(async move {
+                                    match provider
+                                        .embed_documents(std::slice::from_ref(&text))
+                                        .await
+                                    {
+                                        Ok(mut embeddings) => {
+                                            if let Some(embedding) = embeddings.pop() {
+                                                let dims = embedding.len();
+                                                if let Err(e) = store.insert_group_message(
+                                                    "line", &group_id, &user_id, &text, &embedding,
+                                                    dims,
+                                                ) {
+                                                    warn!("group RAG: insert failed: {e}");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => warn!("group RAG: embed failed: {e}"),
+                                    }
+                                })
+                            });
+
+                        // Wrap on_message to handle RAG commands and prepend retrieved context.
+                        let rag_store = Arc::clone(&store);
+                        let rag_provider = Arc::clone(&provider);
+                        let rag_allowlist = Arc::clone(&allowlist);
+                        let inner_on_message = Arc::clone(&on_message);
+                        // Lazy cache: user_id → display_name, populated on first query per user.
+                        let name_cache: Arc<Mutex<HashMap<String, String>>> =
+                            Arc::new(Mutex::new(HashMap::new()));
+                        let rag_client = reqwest::Client::new();
+                        let rag_token = channel_access_token.clone();
+                        let rag_on_message: LineOnMessageFn = Arc::new(
+                            move |user_id: String,
+                                  context_id: String,
+                                  text: String,
+                                  is_group: bool,
+                                  file: Option<LineFile>,
+                                  delta_tx: Option<tokio::sync::mpsc::Sender<String>>| {
+                                let store = Arc::clone(&rag_store);
+                                let provider = Arc::clone(&rag_provider);
+                                let allowlist = Arc::clone(&rag_allowlist);
+                                let inner = Arc::clone(&inner_on_message);
+                                let top_k = rag_top_k;
+                                let name_cache = Arc::clone(&name_cache);
+                                let rag_client = rag_client.clone();
+                                let rag_token = rag_token.clone();
+                                Box::pin(async move {
+                                    // RAG group commands (mention required, handled before agent).
+                                    // Strip leading @mention token so "@bot !cmd" matches "!cmd".
+                                    if is_group {
+                                        let stripped = text.trim();
+                                        let cmd = stripped
+                                            .strip_prefix(|c: char| c == '@')
+                                            .and_then(|s| s.split_once(char::is_whitespace))
+                                            .map(|(_, rest)| rest.trim())
+                                            .unwrap_or(stripped);
+                                        if cmd == "!context-stats" {
+                                            let count = store
+                                                .count_group_messages("line", &context_id)
+                                                .unwrap_or(0);
+                                            return Ok(ChannelResponse::Text(format!(
+                                                "Group context: {count} messages stored"
+                                            )));
+                                        }
+                                        if cmd == "!clear-context" {
+                                            let is_allowed =
+                                                allowlist.lock().unwrap().is_allowed(&user_id);
+                                            if !is_allowed {
+                                                return Ok(ChannelResponse::Text(
+                                                    "Only authorized users can clear group context."
+                                                        .to_string(),
+                                                ));
+                                            }
+                                            let deleted = store
+                                                .clear_group_messages("line", &context_id)
+                                                .unwrap_or(0);
+                                            return Ok(ChannelResponse::Text(format!(
+                                                "Group context cleared. ({deleted} messages removed)"
+                                            )));
+                                        }
+                                        // Route /clear and !clear through inner with stripped text.
+                                        if cmd == "/clear" || cmd == "!clear" {
+                                            return inner(
+                                                user_id,
+                                                context_id,
+                                                cmd.to_string(),
+                                                is_group,
+                                                file,
+                                                delta_tx,
+                                            )
+                                            .await;
+                                        }
+                                        // Route !ingest through inner with stripped text so the
+                                        // pending file lookup uses the correct session key.
+                                        if cmd == "!ingest"
+                                            || cmd.starts_with("!ingest ")
+                                            || cmd == "/ingest"
+                                            || cmd.starts_with("/ingest ")
+                                        {
+                                            return inner(
+                                                user_id,
+                                                context_id,
+                                                cmd.to_string(),
+                                                is_group,
+                                                file,
+                                                delta_tx,
+                                            )
+                                            .await;
+                                        }
+                                    }
+
+                                    // Inject retrieved group messages as context prefix so the
+                                    // agent can answer questions about past chat while still
+                                    // having access to all tools for action requests.
+                                    let augmented_text = if is_group && file.is_none() {
+                                        match provider.embed_query(&text).await {
+                                            Ok(query_embedding) => {
+                                                let dims = query_embedding.len();
+                                                match store.search_group_messages(
+                                                    "line",
+                                                    &context_id,
+                                                    &query_embedding,
+                                                    dims,
+                                                    top_k,
+                                                ) {
+                                                    Ok(hits) if !hits.is_empty() => {
+                                                        let mut lines =
+                                                            Vec::with_capacity(hits.len());
+                                                        for (uid, msg) in &hits {
+                                                            let display = {
+                                                                let cached = name_cache
+                                                                    .lock()
+                                                                    .unwrap()
+                                                                    .get(uid)
+                                                                    .cloned();
+                                                                if let Some(name) = cached {
+                                                                    name
+                                                                } else {
+                                                                    match opencrust_channels::line::api::get_group_member_display_name(
+                                                                        &rag_client,
+                                                                        &rag_token,
+                                                                        &context_id,
+                                                                        uid,
+                                                                        opencrust_channels::line::api::LINE_API_BASE,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        Ok(name) => {
+                                                                            name_cache
+                                                                                .lock()
+                                                                                .unwrap()
+                                                                                .insert(
+                                                                                    uid.clone(),
+                                                                                    name.clone(),
+                                                                                );
+                                                                            name
+                                                                        }
+                                                                        Err(_) => uid.clone(),
+                                                                    }
+                                                                }
+                                                            };
+                                                            lines.push(format!("{display}: {msg}"));
+                                                        }
+                                                        let context_block = lines.join("\n");
+                                                        format!(
+                                                            "[Recent group context — these are recent messages from this group chat. \
+                                                             Use them if relevant to the user's question. \
+                                                             Each line is formatted as <display_name>: <message>.]\n\
+                                                             {context_block}\n---\n{text}"
+                                                        )
+                                                    }
+                                                    _ => text.clone(),
+                                                }
+                                            }
+                                            Err(_) => text.clone(),
+                                        }
+                                    } else {
+                                        text.clone()
+                                    };
+
+                                    inner(user_id, context_id, augmented_text, is_group, file, delta_tx).await
+                                })
+                            },
+                        );
+
+                        let channel = LineChannel::with_group_filter(
+                            channel_access_token,
+                            channel_secret,
+                            rag_on_message,
+                            group_filter,
+                        )
+                        .with_group_observe(observe_fn)
+                        .with_name(name.clone());
+                        channels.push(channel);
+                        info!("configured line channel: {name}");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "line channel '{name}': failed to open group RAG store: {e}, disabling RAG"
+                        );
+                    }
+                }
+            }
+        }
+
         let channel = LineChannel::with_group_filter(
             channel_access_token,
             channel_secret,
             on_message,
             group_filter,
-        );
+        )
+        .with_name(name.clone());
         channels.push(channel);
         info!("configured line channel: {name}");
     }
@@ -3597,12 +3642,8 @@ pub fn build_wechat_channels(
             _ => Arc::new(|_| true),
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        let allowlist = Arc::clone(&state.allowlist);
+        let pairing = Arc::clone(&state.pairing);
         let policy = Arc::new(ChannelPolicy::from_settings(&channel_config.settings));
 
         let state_for_cb = Arc::clone(state);
@@ -3660,41 +3701,14 @@ pub fn build_wechat_channels(
                         || text.trim().starts_with("!ingest ")
                     {
                         if let Some(pending) = state.take_pending_file(&session_id) {
-                            let doc_store =
-                                opencrust_db::DocumentStore::open(&data_dir.join("memory.db"))
-                                    .map_err(|e| format!("failed to open document store: {e}"))?;
-                            let embed = state.agents.embedding_provider();
-                            let replace = text.to_lowercase().contains("replace");
-                            return match crate::ingest::ingest_from_bytes(
+                            return crate::ingest::run_ingest(
+                                &state,
+                                &data_dir,
+                                &text,
                                 &pending.filename,
                                 &pending.data,
-                                &doc_store,
-                                embed.as_deref(),
-                                replace,
                             )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let note = if result.has_embeddings {
-                                        String::new()
-                                    } else {
-                                        " (no embedding provider — keyword search only)".to_string()
-                                    };
-                                    Ok(ChannelResponse::Text(format!(
-                                        "Ingested {}: {} chunk(s){}{note}.",
-                                        result.name,
-                                        result.chunk_count,
-                                        if result.replaced {
-                                            ", replaced previous version"
-                                        } else {
-                                            ""
-                                        },
-                                    )))
-                                }
-                                Err(e) => {
-                                    Ok(ChannelResponse::Text(format!("Ingestion failed: {e}")))
-                                }
-                            };
+                            .await;
                         } else {
                             return Ok(ChannelResponse::Text(
                                 "No file pending. Send an image first, then !ingest.".to_string(),
@@ -3702,20 +3716,26 @@ pub fn build_wechat_channels(
                         }
                     }
 
-                    // Image received — store as pending and prompt the user.
+                    // File received — store as pending and prompt the user.
                     if let Some(wechat_file) = file {
                         let fname = wechat_file.filename.clone();
-                        state.set_pending_file(
-                            &session_id,
-                            crate::state::PendingFile {
-                                filename: wechat_file.filename,
-                                data: wechat_file.data,
-                                received_at: std::time::Instant::now(),
-                            },
-                        );
-                        return Ok(ChannelResponse::Text(format!(
-                            "Image received: {fname}. Send !ingest to add it to memory, or !ingest replace to overwrite an existing version."
-                        )));
+                        if opencrust_media::is_supported_for_ingest(&fname) {
+                            state.set_pending_file(
+                                &session_id,
+                                crate::state::PendingFile {
+                                    filename: wechat_file.filename,
+                                    data: wechat_file.data,
+                                    received_at: std::time::Instant::now(),
+                                },
+                            );
+                            return Ok(ChannelResponse::Text(format!(
+                                "File received: {fname}. Send !ingest to add it to memory, or !ingest replace to overwrite an existing version."
+                            )));
+                        }
+                        // Unsupported file type (e.g. image) with no accompanying text — stay silent.
+                        if text.trim().is_empty() {
+                            return Ok(ChannelResponse::Text(String::new()));
+                        }
                     }
 
                     state.check_user_rate_limit(&user_id, &rate_limit_config)?;
@@ -3823,14 +3843,10 @@ pub fn build_wechat_channels(
             },
         );
 
-        let channel = Arc::new(WeChatChannel::with_group_filter(
-            appid,
-            secret,
-            token,
-            on_message,
-            group_filter,
-        ));
-        channels.push(channel);
+        let channel =
+            WeChatChannel::with_group_filter(appid, secret, token, on_message, group_filter)
+                .with_name(name.clone());
+        channels.push(Arc::new(channel));
         info!("configured wechat channel: {name}");
     }
 
@@ -3967,7 +3983,7 @@ mod tests {
     #[tokio::test]
     async fn build_agent_runtime_empty_config_no_crash() {
         let config = AppConfig::default();
-        let runtime = build_agent_runtime(&config).await;
+        let (runtime, _handle) = build_agent_runtime(&config).await;
         // Should succeed with no providers or tools crashing
         assert!(runtime.system_prompt().is_none());
     }
@@ -3986,7 +4002,7 @@ mod tests {
             },
         );
         // Should not panic — unknown providers are logged and skipped
-        let _runtime = build_agent_runtime(&config).await;
+        let _r = build_agent_runtime(&config).await;
     }
 
     #[tokio::test]
@@ -4003,7 +4019,7 @@ mod tests {
             },
         );
         // Should register the vllm provider without panicking
-        let _runtime = build_agent_runtime(&config).await;
+        let _r = build_agent_runtime(&config).await;
     }
 
     #[test]

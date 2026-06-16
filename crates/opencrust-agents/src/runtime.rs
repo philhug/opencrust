@@ -10,6 +10,7 @@ use futures::future::join_all;
 use opencrust_common::{Error, Result};
 use opencrust_db::{
     DocumentStore, MemoryEntry, MemoryProvider, MemoryRole, NewMemoryEntry, RecallQuery,
+    TrajectoryStore, TrajectorySummary,
 };
 use tokio::sync::mpsc;
 use tracing::{info, instrument, warn};
@@ -29,6 +30,16 @@ const SKILL_REFLECTION_THRESHOLD: usize = 3;
 const DEFAULT_SKILL_RECALL_LIMIT: usize = 5;
 /// Minimum cosine similarity for a skill to be considered relevant (0–1).
 const SKILL_SIMILARITY_THRESHOLD: f64 = 0.25;
+/// Minimum confidence (0–1) required before the refine nudge applies a patch.
+const SKILL_REFINE_CONFIDENCE_THRESHOLD: f64 = 0.7;
+/// Minimum number of cross-session occurrences before a trajectory pattern triggers auto-save.
+const TRAJECTORY_AUTO_SUGGEST_MIN_OCCURRENCES: usize = 5;
+/// Cooldown between trajectory auto-suggest checks (seconds). Prevents querying the DB every turn.
+const TRAJECTORY_SUGGEST_COOLDOWN_SECS: u64 = 600;
+/// Skills not used within this many days are candidates for pruning.
+const SKILL_PRUNE_UNUSED_DAYS: u64 = 30;
+/// Maximum sessions compressed per `compress_old_trajectories` call to bound LLM cost.
+const COMPRESSION_BATCH_SIZE: usize = 20;
 
 /// Default base system prompt when none is configured.
 const DEFAULT_BASE_SYSTEM_PROMPT: &str = "\
@@ -78,6 +89,13 @@ pub struct AgentRuntime {
     debug: bool,
     /// Debug info accumulated during message processing, keyed by session_id.
     debug_accumulator: Mutex<HashMap<String, Vec<String>>>,
+    /// Optional trajectory store. When set, every tool call and turn end is persisted.
+    trajectory_store: Option<Arc<TrajectoryStore>>,
+    /// Per-session turn counter used to order trajectory events.
+    session_turn_index: DashMap<String, u32>,
+    /// Timestamp of the last trajectory auto-suggest check. Used to rate-limit
+    /// the cross-session pattern query (at most once per 10 minutes).
+    trajectory_last_suggest_at: Mutex<Option<std::time::Instant>>,
     /// Path to the document store DB for auto-RAG injection.
     doc_db_path: Option<PathBuf>,
     /// Cached document store opened once at startup for auto-RAG.
@@ -102,6 +120,9 @@ struct NudgeContext<'a> {
     system: &'a Option<String>,
     model: &'a str,
     max_tokens: u32,
+    /// The raw skill block injected into the system prompt for this turn.
+    /// Used by `skill_refine_nudge_followup` to locate skill CHANGELOG files.
+    skills_content: Option<&'a str>,
 }
 
 impl AgentRuntime {
@@ -131,6 +152,9 @@ impl AgentRuntime {
             session_skills_override: DashMap::new(),
             debug: false,
             debug_accumulator: Mutex::new(HashMap::new()),
+            trajectory_store: None,
+            session_turn_index: DashMap::new(),
+            trajectory_last_suggest_at: Mutex::new(None),
         }
     }
 
@@ -301,6 +325,234 @@ impl AgentRuntime {
         self.recall_limit = limit;
     }
 
+    pub fn set_trajectory_store(&mut self, store: Arc<TrajectoryStore>) {
+        self.trajectory_store = Some(store);
+    }
+
+    /// Analyse stored trajectories and return skill suggestions for tool sequences
+    /// that have been repeated at least `min_occurrences` times.
+    ///
+    /// Returns an empty vec when trajectory collection is disabled or no patterns
+    /// meet the threshold.
+    pub fn suggest_skills(
+        &self,
+        min_occurrences: usize,
+    ) -> Vec<crate::skill_suggester::SkillSuggestion> {
+        let Some(store) = &self.trajectory_store else {
+            return Vec::new();
+        };
+        let skills_dir = self.skills_dir();
+        crate::skill_suggester::suggest_from_trajectories(store, &skills_dir, min_occurrences)
+    }
+
+    /// Increment the per-session turn counter and return the index for this turn.
+    fn traj_advance_turn(&self, session_id: &str) -> u32 {
+        let mut entry = self
+            .session_turn_index
+            .entry(session_id.to_string())
+            .or_insert(0);
+        let idx = *entry;
+        *entry += 1;
+        idx
+    }
+
+    fn traj_log_tool_call(
+        &self,
+        session_id: &str,
+        turn_index: u32,
+        name: &str,
+        input: &serde_json::Value,
+    ) {
+        if let Some(store) = &self.trajectory_store {
+            store
+                .log_tool_call(session_id, turn_index, name, &input.to_string())
+                .unwrap_or_else(|e| warn!("trajectory log_tool_call failed: {e}"));
+        }
+    }
+
+    fn traj_log_tool_result(
+        &self,
+        session_id: &str,
+        turn_index: u32,
+        name: &str,
+        output: &str,
+        latency_ms: u64,
+    ) {
+        if let Some(store) = &self.trajectory_store {
+            store
+                .log_tool_result(session_id, turn_index, name, output, latency_ms)
+                .unwrap_or_else(|e| warn!("trajectory log_tool_result failed: {e}"));
+        }
+    }
+
+    fn traj_log_turn_end(&self, session_id: &str, turn_index: u32, output: &str, tokens: u32) {
+        if let Some(store) = &self.trajectory_store {
+            store
+                .log_turn_end(session_id, turn_index, output, tokens)
+                .unwrap_or_else(|e| warn!("trajectory log_turn_end failed: {e}"));
+        }
+    }
+
+    /// Log every skill name found in a prompt block as a usage event.
+    ///
+    /// Parses `## skill-name` headings from the injected skills block so we can
+    /// track which skills are actively retrieved without changing return types of
+    /// the retrieval functions.
+    fn log_injected_skills(&self, session_id: &str, skills_block: &str) {
+        let Some(store) = &self.trajectory_store else {
+            return;
+        };
+        for line in skills_block.lines() {
+            if let Some(name) = line.strip_prefix("## ") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    store
+                        .log_skill_usage(session_id, name)
+                        .unwrap_or_else(|e| warn!("skill usage log failed: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Archive skills that have not been injected in any session for at least
+    /// `SKILL_PRUNE_UNUSED_DAYS` days. Archiving renames the skill folder to
+    /// `{name}.archived` so it can be recovered manually if needed.
+    ///
+    /// Returns the names of skills that were archived.
+    pub fn prune_unused_skills(&self) -> Vec<String> {
+        let Some(store) = &self.trajectory_store else {
+            return Vec::new();
+        };
+        let skills_dir = self.skills_dir();
+        let skills = match opencrust_skills::SkillScanner::new(&skills_dir).discover() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("prune_unused_skills: skill scan failed: {e}");
+                return Vec::new();
+            }
+        };
+        if skills.is_empty() {
+            return Vec::new();
+        }
+        let cutoff = chrono::Utc::now().timestamp() - (SKILL_PRUNE_UNUSED_DAYS * 86_400) as i64;
+        let names: Vec<&str> = skills.iter().map(|s| s.frontmatter.name.as_str()).collect();
+        let unused = match store.skills_unused_since(&names, cutoff) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("prune_unused_skills: query failed: {e}");
+                return Vec::new();
+            }
+        };
+        let mut pruned = Vec::new();
+        for name in &unused {
+            let skill_dir = skills_dir.join(name);
+            let archive_dir = skills_dir.join(format!("{name}.archived"));
+            if skill_dir.is_dir() {
+                if let Err(e) = std::fs::rename(&skill_dir, &archive_dir) {
+                    warn!("prune_unused_skills: failed to archive '{name}': {e}");
+                } else {
+                    info!(
+                        "prune_unused_skills: archived skill '{name}' (unused >{SKILL_PRUNE_UNUSED_DAYS}d)"
+                    );
+                    pruned.push(name.clone());
+                }
+            }
+        }
+        pruned
+    }
+
+    /// Compress trajectory sessions older than `older_than_days` days using an LLM.
+    ///
+    /// For each qualifying session the raw events are formatted as text, sent to the
+    /// LLM (no tools, JSON reply), and the resulting `TrajectorySummary` is persisted.
+    /// Raw events are then deleted, keeping the DB size bounded.
+    ///
+    /// At most `COMPRESSION_BATCH_SIZE` sessions are processed per call to limit
+    /// LLM costs. Returns the number of sessions successfully compressed.
+    pub async fn compress_old_trajectories(&self, older_than_days: u64) -> usize {
+        let Some(store) = &self.trajectory_store else {
+            return 0;
+        };
+        let sessions = match store.sessions_older_than(older_than_days) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("compress_old_trajectories: sessions query failed: {e}");
+                return 0;
+            }
+        };
+        if sessions.is_empty() {
+            return 0;
+        }
+        let provider: Arc<dyn LlmProvider> = match self.default_provider() {
+            Some(p) => p,
+            None => {
+                warn!("compress_old_trajectories: no LLM provider configured");
+                return 0;
+            }
+        };
+        let model = provider
+            .configured_model()
+            .unwrap_or("claude-haiku-4-5-20251001")
+            .to_string();
+
+        let mut compressed = 0usize;
+        for session_id in sessions.iter().take(COMPRESSION_BATCH_SIZE) {
+            let text = match store.export_session_for_compression(session_id) {
+                Ok(t) if !t.is_empty() => t,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("compress_old_trajectories: export failed for {session_id}: {e}");
+                    continue;
+                }
+            };
+            let turn_count = text.lines().filter(|l| l.starts_with("turn ")).count();
+            let prompt = format!(
+                "You are analysing tool-call logs from an AI agent session.\n\n\
+                 Session ID: {session_id}\n\
+                 Tool calls:\n{text}\n\n\
+                 Respond with a JSON object only — no other text:\n\
+                 {{\"summary_text\": \"<what the agent was doing>\",\
+                   \"candidate_skill\": \"<kebab-case-name or null>\",\
+                   \"tool_pattern\": [\"<tool1>\", \"<tool2>\"],\
+                   \"confidence\": <0.0-1.0>,\
+                   \"user_intent\": \"<brief goal or null>\"}}\n\
+                 Set candidate_skill to null if confidence < 0.6."
+            );
+            let request = LlmRequest {
+                model: model.clone(),
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: MessagePart::Text(prompt),
+                }],
+                system: None,
+                max_tokens: Some(256),
+                temperature: None,
+                tools: vec![],
+            };
+            let response = match provider.complete(&request).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("compress_old_trajectories: LLM call failed for {session_id}: {e}");
+                    continue;
+                }
+            };
+            let raw = extract_text(&response.content);
+            let parsed = parse_compression_response(&raw, session_id, turn_count);
+            if let Err(e) = store.save_summary(&parsed) {
+                warn!("compress_old_trajectories: save_summary failed for {session_id}: {e}");
+                continue;
+            }
+            match store.delete_session_events(session_id) {
+                Ok(n) => {
+                    info!("compress_old_trajectories: compressed session {session_id} ({n} events)")
+                }
+                Err(e) => warn!("compress_old_trajectories: delete failed for {session_id}: {e}"),
+            }
+            compressed += 1;
+        }
+        compressed
+    }
+
     pub fn set_summarization_enabled(&mut self, enabled: bool) {
         self.summarization_enabled = enabled;
     }
@@ -331,20 +583,27 @@ impl AgentRuntime {
     /// Set the tool configuration for a session before processing a message.
     /// `allowed_tools = None` means all tools are permitted.
     /// `budget = None` means no per-session call-count cap.
+    ///
+    /// Preserves the existing `call_count` so the budget is enforced across
+    /// the whole session, not reset on every incoming message.
     pub fn set_session_tool_config(
         &self,
         session_id: &str,
         allowed_tools: Option<Vec<String>>,
         budget: Option<u32>,
     ) {
-        self.session_tool_config.insert(
-            session_id.to_string(),
-            SessionToolConfig {
+        self.session_tool_config
+            .entry(session_id.to_string())
+            .and_modify(|cfg| {
+                cfg.allowed_tools = allowed_tools.clone();
+                cfg.budget = budget;
+                // call_count is intentionally preserved
+            })
+            .or_insert(SessionToolConfig {
                 allowed_tools,
                 call_count: 0,
                 budget,
-            },
-        );
+            });
     }
 
     /// Remove the tool configuration for a session (called during cleanup).
@@ -379,6 +638,34 @@ impl AgentRuntime {
         F: Fn(&str) -> bool,
     {
         self.session_user_name.retain(|id, _| f(id));
+    }
+
+    /// Retain only DNA overrides whose session IDs satisfy the predicate.
+    pub fn retain_session_dna_overrides<F>(&self, f: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.session_dna_override.retain(|id, _| f(id));
+    }
+
+    /// Retain only skills overrides whose session IDs satisfy the predicate.
+    pub fn retain_session_skills_overrides<F>(&self, f: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.session_skills_override.retain(|id, _| f(id));
+    }
+
+    /// Returns `true` if a DNA override is stored for the session.
+    /// Intended for use in tests and diagnostics.
+    pub fn has_session_dna_override(&self, session_id: &str) -> bool {
+        self.session_dna_override.contains_key(session_id)
+    }
+
+    /// Returns `true` if a skills override is stored for the session.
+    /// Intended for use in tests and diagnostics.
+    pub fn has_session_skills_override(&self, session_id: &str) -> bool {
+        self.session_skills_override.contains_key(session_id)
     }
 
     /// Get the user display name for a session.
@@ -710,6 +997,48 @@ impl AgentRuntime {
             .map(|t| t.as_ref())
     }
 
+    /// Execute a tool, logging call/result to the trajectory store and recording debug info.
+    async fn run_tool(
+        &self,
+        session_id: &str,
+        traj_turn_index: u32,
+        context: &ToolContext,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> ToolOutput {
+        self.traj_log_tool_call(session_id, traj_turn_index, name, input);
+        let t0 = std::time::Instant::now();
+        let output = match self.check_tool_allowed(session_id, name) {
+            Err(e) => ToolOutput::error(e.to_string()),
+            Ok(()) => match self.find_tool(name) {
+                Some(tool) => tool
+                    .execute(context, input.clone())
+                    .await
+                    .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
+                None => ToolOutput::error(format!("unknown tool: {}", name)),
+            },
+        };
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        self.traj_log_tool_result(
+            session_id,
+            traj_turn_index,
+            name,
+            &output.content,
+            latency_ms,
+        );
+        self.record_debug_tool_call(session_id, name, &input.to_string());
+        output
+    }
+
+    /// Return the skills directory from the registered `create_skill` tool, if any.
+    fn skills_dir(&self) -> std::path::PathBuf {
+        self.tools
+            .iter()
+            .find(|t| t.name() == "create_skill")
+            .and_then(|t| t.skills_dir_hint())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
     /// Return a reflection nudge when the agent has completed a complex multi-tool workflow
     /// and the `create_skill` tool is available. Returns `None` when below threshold or
     /// when self-learning is disabled (tool not registered).
@@ -718,12 +1047,10 @@ impl AgentRuntime {
     ///
     /// Passes `tools: vec![]` to prevent the model from entering another tool loop.
     /// Returns `None` if `create_skill` is not registered, the threshold is not met,
-    /// skills were already injected (agent is executing from an existing skill, not
-    /// discovering a new workflow), or the follow-up call fails.
+    /// or the follow-up call fails.
     async fn skill_nudge_followup(
         &self,
         tool_call_count: usize,
-        skills_were_injected: bool,
         ctx: NudgeContext<'_>,
         session_id: &str,
     ) -> Option<String> {
@@ -733,13 +1060,9 @@ impl AgentRuntime {
             system,
             model,
             max_tokens,
+            skills_content: _,
         } = ctx;
         if tool_call_count < SKILL_REFLECTION_THRESHOLD {
-            return None;
-        }
-        // If a skill was already retrieved for this query the agent is executing
-        // from an existing skill — suppress the nudge to avoid asking to save it again.
-        if skills_were_injected {
             return None;
         }
         if !self.tools.iter().any(|t| t.name() == "create_skill") {
@@ -783,6 +1106,365 @@ impl AgentRuntime {
                 None
             }
         }
+    }
+
+    /// Fire a self-improvement nudge when the agent used an existing skill.
+    ///
+    /// Makes a follow-up LLM call with `create_skill` available so the model can
+    /// call `patch` autonomously if the skill had gaps. Returns a brief user-visible
+    /// note when a patch was applied, or `None` when no improvement was needed.
+    async fn skill_refine_nudge_followup(
+        &self,
+        tool_call_count: usize,
+        ctx: NudgeContext<'_>,
+        session_id: &str,
+    ) -> Option<String> {
+        let NudgeContext {
+            provider,
+            messages,
+            system,
+            model,
+            max_tokens,
+            skills_content,
+        } = ctx;
+        if tool_call_count < SKILL_REFLECTION_THRESHOLD {
+            return None;
+        }
+        let create_skill_def = self
+            .tools
+            .iter()
+            .find(|t| t.name() == "create_skill")
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })?;
+        // Build patch history context from CHANGELOG files of injected skills.
+        let changelog_context = skills_content
+            .map(|sc| build_changelog_context(sc, &self.skills_dir()))
+            .unwrap_or_default();
+        let history_note = if changelog_context.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nRecent patch history for the skill(s) used:\n{changelog_context}\
+                 Only patch if you found a NEW gap not already addressed by recent changes."
+            )
+        };
+        // ── Round 1: confidence assessment (no tools, JSON reply) ────────────
+        let mut msgs = messages.to_vec();
+        msgs.push(ChatMessage {
+            role: ChatRole::User,
+            content: MessagePart::Text(format!(
+                "[internal] You just completed a task using an existing skill. \
+                 Assess whether the skill needs improvement. \
+                 Reply with a JSON object only — no other text:\n\
+                 {{\"should_patch\": <true|false>, \"confidence\": <0.0–1.0>, \
+                 \"reason\": \"<one line>\", \"skill_name\": \"<name>\"}}\n\
+                 confidence = how certain you are that a gap exists (not how bad the gap is). \
+                 If the skill worked well, set should_patch=false.{history_note}"
+            )),
+        });
+        let assess_request = LlmRequest {
+            model: model.to_string(),
+            messages: msgs.clone(),
+            system: system.clone(),
+            max_tokens: Some(128),
+            temperature: None,
+            tools: vec![],
+        };
+        let assess_response = match provider.complete(&assess_request).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("skill refine assess LLM call failed: {}", e);
+                return None;
+            }
+        };
+        if let Some(usage) = &assess_response.usage {
+            self.accumulate_usage(
+                session_id,
+                provider.provider_id(),
+                &assess_response.model,
+                usage.input_tokens,
+                usage.output_tokens,
+            );
+        }
+        // Parse assessment JSON; skip patch if confidence < threshold.
+        let assessment_text = extract_text(&assess_response.content);
+        let assessment = parse_refine_assessment(&assessment_text);
+        if !assessment.should_patch || assessment.confidence < SKILL_REFINE_CONFIDENCE_THRESHOLD {
+            return None;
+        }
+
+        // ── Round 2: execute patch (with create_skill tool) ──────────────────
+        msgs.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessagePart::Text(assessment_text),
+        });
+        msgs.push(ChatMessage {
+            role: ChatRole::User,
+            content: MessagePart::Text(
+                "[internal] Confidence threshold met. \
+                 Call create_skill with action='patch' to apply the improvement now. \
+                 Include the 'reason' field from your assessment."
+                    .to_string(),
+            ),
+        });
+        let request = LlmRequest {
+            model: model.to_string(),
+            messages: msgs,
+            system: system.clone(),
+            max_tokens: Some(max_tokens.min(512)),
+            temperature: None,
+            tools: vec![create_skill_def],
+        };
+        let response = match provider.complete(&request).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("skill refine nudge LLM call failed: {}", e);
+                return None;
+            }
+        };
+        if let Some(usage) = &response.usage {
+            self.accumulate_usage(
+                session_id,
+                provider.provider_id(),
+                &response.model,
+                usage.input_tokens,
+                usage.output_tokens,
+            );
+        }
+        // Look for a patch tool call in the response.
+        for block in &response.content {
+            if let ContentBlock::ToolUse { name, input, .. } = block
+                && name == "create_skill"
+                && input.get("action").and_then(|v| v.as_str()) == Some("patch")
+            {
+                let skill_name = input
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let ctx = ToolContext {
+                    session_id: session_id.to_string(),
+                    user_id: None,
+                    heartbeat_depth: 0,
+                    allowed_tools: None,
+                };
+                if let Some(tool) = self.find_tool("create_skill") {
+                    match tool.execute(&ctx, input.clone()).await {
+                        Ok(out) if !out.is_error => {
+                            return Some(format!(
+                                "_(Skill '{skill_name}' updated based on this session.)_"
+                            ));
+                        }
+                        Ok(out) => {
+                            warn!("skill refine patch failed: {}", out.content);
+                        }
+                        Err(e) => {
+                            warn!("skill refine patch error: {}", e);
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Auto-save a skill when trajectory data shows a cross-session repeated tool sequence
+    /// that is not yet covered by an existing skill.
+    ///
+    /// Fires only when:
+    /// - Trajectory collection is enabled.
+    /// - `tool_call_count >= SKILL_REFLECTION_THRESHOLD` (avoids running on trivial turns).
+    /// - `create_skill` tool is registered.
+    /// - At least one uncovered pattern meets `TRAJECTORY_AUTO_SUGGEST_MIN_OCCURRENCES`.
+    ///
+    /// Makes two LLM calls:
+    /// 1. Ask the model to generate a skill body for the top pattern.
+    /// 2. Execute `create_skill` with `action='create'` to persist it.
+    ///
+    /// Returns a brief user-visible note on success, or `None` when skipped / failed.
+    async fn trajectory_auto_suggest_followup(
+        &self,
+        tool_call_count: usize,
+        ctx: NudgeContext<'_>,
+        session_id: &str,
+    ) -> Option<String> {
+        if tool_call_count < SKILL_REFLECTION_THRESHOLD {
+            return None;
+        }
+        self.trajectory_store.as_ref()?;
+
+        // Rate-limit: skip if we checked within the cooldown window.
+        {
+            let mut last = self
+                .trajectory_last_suggest_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let cooldown = std::time::Duration::from_secs(TRAJECTORY_SUGGEST_COOLDOWN_SECS);
+            if last.is_some_and(|t: std::time::Instant| t.elapsed() < cooldown) {
+                return None;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+
+        let create_skill_def = self
+            .tools
+            .iter()
+            .find(|t| t.name() == "create_skill")
+            .map(|t| ToolDefinition {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })?;
+
+        let suggestions = self.suggest_skills(TRAJECTORY_AUTO_SUGGEST_MIN_OCCURRENCES);
+        let candidate = suggestions.into_iter().find(|s| !s.already_covered)?;
+
+        let NudgeContext {
+            provider,
+            messages,
+            system,
+            model,
+            max_tokens,
+            ..
+        } = ctx;
+
+        // ── Round 1: generate skill body ─────────────────────────────────────
+        let mut msgs = messages.to_vec();
+        msgs.push(ChatMessage {
+            role: ChatRole::User,
+            content: MessagePart::Text(format!(
+                "[internal] The trajectory log shows the tool sequence '{}' has been used \
+                 {} times across sessions and is not yet captured as a skill. \
+                 Generate a concise, reusable skill for this workflow. \
+                 Call create_skill with action='create', providing name, description, \
+                 body (≥80 chars), rationale (≥40 chars), and triggers. \
+                 Use the same language the user writes in. Do not ask the user for confirmation.",
+                candidate.fingerprint, candidate.occurrences
+            )),
+        });
+        let request = LlmRequest {
+            model: model.to_string(),
+            messages: msgs,
+            system: system.clone(),
+            max_tokens: Some(max_tokens.min(1024)),
+            temperature: None,
+            tools: vec![create_skill_def],
+        };
+        let response = match provider.complete(&request).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("trajectory auto-suggest LLM call failed: {e}");
+                return None;
+            }
+        };
+        if let Some(usage) = &response.usage {
+            self.accumulate_usage(
+                session_id,
+                provider.provider_id(),
+                &response.model,
+                usage.input_tokens,
+                usage.output_tokens,
+            );
+        }
+
+        // ── Round 2: execute create_skill if the model called it ─────────────
+        for block in &response.content {
+            if let ContentBlock::ToolUse { name, input, .. } = block
+                && name == "create_skill"
+                && input
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("create")
+                    == "create"
+            {
+                let skill_name = input
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let tool_ctx = ToolContext {
+                    session_id: session_id.to_string(),
+                    user_id: None,
+                    heartbeat_depth: 0,
+                    allowed_tools: None,
+                };
+                if let Some(tool) = self.find_tool("create_skill") {
+                    match tool.execute(&tool_ctx, input.clone()).await {
+                        Ok(out) if !out.is_error => {
+                            info!(
+                                "trajectory auto-suggest: saved skill '{skill_name}' \
+                                 from pattern '{}'",
+                                candidate.fingerprint
+                            );
+                            return Some(format!(
+                                "_(Auto-saved skill '{skill_name}' from repeated workflow \
+                                 '{}'.)_",
+                                candidate.fingerprint
+                            ));
+                        }
+                        Ok(out) => warn!("trajectory auto-suggest create failed: {}", out.content),
+                        Err(e) => warn!("trajectory auto-suggest create error: {e}"),
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Dispatch post-turn skill follow-ups:
+    ///
+    /// 1. If skills were injected → `skill_refine_nudge_followup` (patch existing skill).
+    /// 2. Otherwise, try `trajectory_auto_suggest_followup` first — auto-save a skill when
+    ///    a cross-session pattern meets the threshold.
+    /// 3. Fall back to `skill_nudge_followup` (ask the user) when no pattern qualifies.
+    async fn skill_completion_followup(
+        &self,
+        tool_call_count: usize,
+        skills_were_injected: bool,
+        ctx: NudgeContext<'_>,
+        session_id: &str,
+    ) -> Option<String> {
+        // All NudgeContext fields are references (Copy) — destructure so we can
+        // pass them to multiple async calls without cloning the pointed-to data.
+        let NudgeContext {
+            provider,
+            messages,
+            system,
+            model,
+            max_tokens,
+            skills_content,
+        } = ctx;
+
+        let make_ctx = || NudgeContext {
+            provider,
+            messages,
+            system,
+            model,
+            max_tokens,
+            skills_content,
+        };
+
+        if skills_were_injected {
+            return self
+                .skill_refine_nudge_followup(tool_call_count, make_ctx(), session_id)
+                .await;
+        }
+
+        // Try trajectory-driven auto-save before falling back to the interactive nudge.
+        if let Some(note) = self
+            .trajectory_auto_suggest_followup(tool_call_count, make_ctx(), session_id)
+            .await
+        {
+            return Some(note);
+        }
+
+        self.skill_nudge_followup(tool_call_count, make_ctx(), session_id)
+            .await
     }
 
     /// Record a tool call for debug output.
@@ -1091,6 +1773,9 @@ impl AgentRuntime {
 
         let dna = self.session_dna_content(session_id);
         let skills = self.session_skills_content(session_id, user_text).await;
+        if let Some(block) = &skills {
+            self.log_injected_skills(session_id, block);
+        }
         let base_prompt = self.base_prompt_with_tools();
         let rag_context = self.auto_rag_context(user_text).await;
         let user_display = self.session_user_name(session_id);
@@ -1118,6 +1803,7 @@ impl AgentRuntime {
         trim_messages_to_budget(&mut messages, &system, &tool_defs, max_ctx);
 
         let mut tool_call_count: usize = 0;
+        let traj_turn_index = self.traj_advance_turn(session_id);
         for _iteration in 0..MAX_TOOL_ITERATIONS {
             let request = LlmRequest {
                 model: effective_model.clone(),
@@ -1154,7 +1840,7 @@ impl AgentRuntime {
                     warn!("failed to store turn in memory: {}", e);
                 }
                 if let Some(followup) = self
-                    .skill_nudge_followup(
+                    .skill_completion_followup(
                         tool_call_count,
                         skills.is_some(),
                         NudgeContext {
@@ -1163,6 +1849,7 @@ impl AgentRuntime {
                             system: &system,
                             model: &effective_model,
                             max_tokens: effective_max_tokens,
+                            skills_content: skills.as_deref(),
                         },
                         session_id,
                     )
@@ -1171,6 +1858,7 @@ impl AgentRuntime {
                     final_text.push_str("\n\n");
                     final_text.push_str(&followup);
                 }
+                self.traj_log_turn_end(session_id, traj_turn_index, &final_text, 0);
                 return Ok(final_text);
             }
 
@@ -1188,16 +1876,9 @@ impl AgentRuntime {
                         heartbeat_depth: depth,
                         allowed_tools: self.session_allowed_tools(session_id),
                     };
-                    let output = match self.check_tool_allowed(session_id, name) {
-                        Err(e) => ToolOutput::error(e.to_string()),
-                        Ok(()) => match self.find_tool(name) {
-                            Some(tool) => tool
-                                .execute(&context, input.clone())
-                                .await
-                                .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                            None => ToolOutput::error(format!("unknown tool: {}", name)),
-                        },
-                    };
+                    let output = self
+                        .run_tool(session_id, traj_turn_index, &context, name, input)
+                        .await;
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: output.content,
@@ -1279,6 +1960,9 @@ impl AgentRuntime {
 
         let dna = self.session_dna_content(session_id);
         let skills = self.session_skills_content(session_id, user_text).await;
+        if let Some(block) = &skills {
+            self.log_injected_skills(session_id, block);
+        }
         let base_prompt = self.base_prompt_with_tools();
         let rag_context = self.auto_rag_context(user_text).await;
         let user_display = self.session_user_name(session_id);
@@ -1332,6 +2016,7 @@ impl AgentRuntime {
         };
 
         let mut tool_call_count: usize = 0;
+        let traj_turn_index = self.traj_advance_turn(session_id);
         for _iteration in 0..MAX_TOOL_ITERATIONS {
             let request = LlmRequest {
                 model: effective_model.clone(),
@@ -1368,7 +2053,7 @@ impl AgentRuntime {
                     warn!("failed to store turn in memory: {}", e);
                 }
                 if let Some(followup) = self
-                    .skill_nudge_followup(
+                    .skill_completion_followup(
                         tool_call_count,
                         skills.is_some(),
                         NudgeContext {
@@ -1377,6 +2062,7 @@ impl AgentRuntime {
                             system: &system,
                             model: &effective_model,
                             max_tokens: effective_max_tokens,
+                            skills_content: skills.as_deref(),
                         },
                         session_id,
                     )
@@ -1402,16 +2088,9 @@ impl AgentRuntime {
                         heartbeat_depth: 0,
                         allowed_tools: self.session_allowed_tools(session_id),
                     };
-                    let output = match self.check_tool_allowed(session_id, name) {
-                        Err(e) => ToolOutput::error(e.to_string()),
-                        Ok(()) => match self.find_tool(name) {
-                            Some(tool) => tool
-                                .execute(&context, input.clone())
-                                .await
-                                .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                            None => ToolOutput::error(format!("unknown tool: {}", name)),
-                        },
-                    };
+                    let output = self
+                        .run_tool(session_id, traj_turn_index, &context, name, input)
+                        .await;
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: output.content,
@@ -1478,6 +2157,9 @@ impl AgentRuntime {
 
         let dna = self.dna_content();
         let skills = self.relevant_skills_content(memory_text).await;
+        if let Some(block) = &skills {
+            self.log_injected_skills(session_id, block);
+        }
         let base_prompt = self.base_prompt_with_tools();
         let rag_context = self.auto_rag_context(memory_text).await;
         let user_display = self.session_user_name(session_id);
@@ -1504,6 +2186,7 @@ impl AgentRuntime {
         trim_messages_to_budget(&mut messages, &system, &tool_defs, max_ctx);
 
         let mut tool_call_count: usize = 0;
+        let traj_turn_index = self.traj_advance_turn(session_id);
         for _iteration in 0..MAX_TOOL_ITERATIONS {
             let request = LlmRequest {
                 model: String::new(),
@@ -1541,7 +2224,7 @@ impl AgentRuntime {
                 // Post-completion: let the LLM generate a natural follow-up question
                 // asking the user whether to save the workflow as a skill.
                 if let Some(followup) = self
-                    .skill_nudge_followup(
+                    .skill_completion_followup(
                         tool_call_count,
                         skills.is_some(),
                         NudgeContext {
@@ -1550,6 +2233,7 @@ impl AgentRuntime {
                             system: &system,
                             model: "",
                             max_tokens: self.max_tokens.unwrap_or(4096),
+                            skills_content: skills.as_deref(),
                         },
                         session_id,
                     )
@@ -1559,6 +2243,7 @@ impl AgentRuntime {
                     final_text.push_str(&followup);
                 }
 
+                self.traj_log_turn_end(session_id, traj_turn_index, &final_text, 0);
                 return Ok(final_text);
             }
 
@@ -1585,17 +2270,9 @@ impl AgentRuntime {
                         heartbeat_depth,
                         allowed_tools: self.session_allowed_tools(session_id),
                     };
-                    let output = match self.check_tool_allowed(session_id, name) {
-                        Err(e) => ToolOutput::error(e.to_string()),
-                        Ok(()) => match self.find_tool(name) {
-                            Some(tool) => tool
-                                .execute(&context, input.clone())
-                                .await
-                                .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                            None => ToolOutput::error(format!("unknown tool: {}", name)),
-                        },
-                    };
-                    self.record_debug_tool_call(session_id, name, &input.to_string());
+                    let output = self
+                        .run_tool(session_id, traj_turn_index, &context, name, input)
+                        .await;
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: output.content,
@@ -1724,6 +2401,9 @@ impl AgentRuntime {
 
         let dna = self.dna_content();
         let skills = self.relevant_skills_content(memory_text).await;
+        if let Some(block) = &skills {
+            self.log_injected_skills(session_id, block);
+        }
         let base_prompt = self.base_prompt_with_tools();
         let rag_context = self.auto_rag_context(memory_text).await;
         let user_display = self.session_user_name(session_id);
@@ -1750,6 +2430,7 @@ impl AgentRuntime {
 
         let mut full_response = String::new();
         let mut tool_call_count: usize = 0;
+        let traj_turn_index = self.traj_advance_turn(session_id);
         for _iteration in 0..MAX_TOOL_ITERATIONS {
             let request = LlmRequest {
                 model: String::new(),
@@ -1837,7 +2518,7 @@ impl AgentRuntime {
                         }
 
                         if let Some(followup) = self
-                            .skill_nudge_followup(
+                            .skill_completion_followup(
                                 tool_call_count,
                                 skills.is_some(),
                                 NudgeContext {
@@ -1846,6 +2527,7 @@ impl AgentRuntime {
                                     system: &system,
                                     model: "",
                                     max_tokens: self.max_tokens.unwrap_or(4096),
+                                    skills_content: skills.as_deref(),
                                 },
                                 session_id,
                             )
@@ -1897,17 +2579,9 @@ impl AgentRuntime {
                             heartbeat_depth: 0,
                             allowed_tools: self.session_allowed_tools(session_id),
                         };
-                        let output = match self.check_tool_allowed(session_id, name) {
-                            Err(e) => ToolOutput::error(e.to_string()),
-                            Ok(()) => match self.find_tool(name) {
-                                Some(tool) => tool
-                                    .execute(&context, input)
-                                    .await
-                                    .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                                None => ToolOutput::error(format!("unknown tool: {}", name)),
-                            },
-                        };
-                        self.record_debug_tool_call(session_id, name, input_json);
+                        let output = self
+                            .run_tool(session_id, traj_turn_index, &context, name, &input)
+                            .await;
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: output.content,
@@ -1963,7 +2637,7 @@ impl AgentRuntime {
                         }
 
                         if let Some(followup) = self
-                            .skill_nudge_followup(
+                            .skill_completion_followup(
                                 tool_call_count,
                                 skills.is_some(),
                                 NudgeContext {
@@ -1972,6 +2646,7 @@ impl AgentRuntime {
                                     system: &system,
                                     model: "",
                                     max_tokens: self.max_tokens.unwrap_or(4096),
+                                    skills_content: skills.as_deref(),
                                 },
                                 session_id,
                             )
@@ -2006,16 +2681,9 @@ impl AgentRuntime {
                                 heartbeat_depth: 0,
                                 allowed_tools: self.session_allowed_tools(session_id),
                             };
-                            let output = match self.check_tool_allowed(session_id, name) {
-                                Err(e) => ToolOutput::error(e.to_string()),
-                                Ok(()) => match self.find_tool(name) {
-                                    Some(tool) => tool
-                                        .execute(&context, input.clone())
-                                        .await
-                                        .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                                    None => ToolOutput::error(format!("unknown tool: {}", name)),
-                                },
-                            };
+                            let output = self
+                                .run_tool(session_id, traj_turn_index, &context, name, input)
+                                .await;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
                                 content: output.content,
@@ -2080,6 +2748,9 @@ impl AgentRuntime {
 
         let dna = self.dna_content();
         let skills = self.relevant_skills_content(memory_text).await;
+        if let Some(block) = &skills {
+            self.log_injected_skills(session_id, block);
+        }
         let base_prompt = self.base_prompt_with_tools();
         let rag_context = self.auto_rag_context(memory_text).await;
         let user_display = self.session_user_name(session_id);
@@ -2129,6 +2800,7 @@ impl AgentRuntime {
         };
 
         let mut tool_call_count: usize = 0;
+        let traj_turn_index = self.traj_advance_turn(session_id);
         for _iteration in 0..MAX_TOOL_ITERATIONS {
             let request = LlmRequest {
                 model: String::new(),
@@ -2173,7 +2845,7 @@ impl AgentRuntime {
                 }
 
                 if let Some(followup) = self
-                    .skill_nudge_followup(
+                    .skill_completion_followup(
                         tool_call_count,
                         skills.is_some(),
                         NudgeContext {
@@ -2182,6 +2854,7 @@ impl AgentRuntime {
                             system: &system,
                             model: "",
                             max_tokens: self.max_tokens.unwrap_or(4096),
+                            skills_content: skills.as_deref(),
                         },
                         session_id,
                     )
@@ -2215,17 +2888,9 @@ impl AgentRuntime {
                         heartbeat_depth,
                         allowed_tools: self.session_allowed_tools(session_id),
                     };
-                    let output = match self.check_tool_allowed(session_id, name) {
-                        Err(e) => ToolOutput::error(e.to_string()),
-                        Ok(()) => match self.find_tool(name) {
-                            Some(tool) => tool
-                                .execute(&context, input.clone())
-                                .await
-                                .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                            None => ToolOutput::error(format!("unknown tool: {}", name)),
-                        },
-                    };
-                    self.record_debug_tool_call(session_id, name, &input.to_string());
+                    let output = self
+                        .run_tool(session_id, traj_turn_index, &context, name, input)
+                        .await;
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: output.content,
@@ -2288,6 +2953,9 @@ impl AgentRuntime {
 
         let dna = self.dna_content();
         let skills = self.relevant_skills_content(memory_text).await;
+        if let Some(block) = &skills {
+            self.log_injected_skills(session_id, block);
+        }
         let base_prompt = self.base_prompt_with_tools();
         let rag_context = self.auto_rag_context(memory_text).await;
         let user_display = self.session_user_name(session_id);
@@ -2337,6 +3005,7 @@ impl AgentRuntime {
 
         let mut full_response = String::new();
         let mut tool_call_count: usize = 0;
+        let traj_turn_index = self.traj_advance_turn(session_id);
         for _iteration in 0..MAX_TOOL_ITERATIONS {
             let request = LlmRequest {
                 model: String::new(),
@@ -2410,7 +3079,7 @@ impl AgentRuntime {
 
                         // Post-completion reflection nudge.
                         if let Some(followup) = self
-                            .skill_nudge_followup(
+                            .skill_completion_followup(
                                 tool_call_count,
                                 skills.is_some(),
                                 NudgeContext {
@@ -2419,6 +3088,7 @@ impl AgentRuntime {
                                     system: &system,
                                     model: "",
                                     max_tokens: self.max_tokens.unwrap_or(4096),
+                                    skills_content: skills.as_deref(),
                                 },
                                 session_id,
                             )
@@ -2481,17 +3151,9 @@ impl AgentRuntime {
                             heartbeat_depth: 0,
                             allowed_tools: self.session_allowed_tools(session_id),
                         };
-                        let output = match self.check_tool_allowed(session_id, name) {
-                            Err(e) => ToolOutput::error(e.to_string()),
-                            Ok(()) => match self.find_tool(name) {
-                                Some(tool) => tool
-                                    .execute(&context, input)
-                                    .await
-                                    .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                                None => ToolOutput::error(format!("unknown tool: {}", name)),
-                            },
-                        };
-                        self.record_debug_tool_call(session_id, name, input_json);
+                        let output = self
+                            .run_tool(session_id, traj_turn_index, &context, name, &input)
+                            .await;
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: output.content,
@@ -2523,7 +3185,7 @@ impl AgentRuntime {
 
                         // Post-completion reflection nudge (fallback path).
                         if let Some(followup) = self
-                            .skill_nudge_followup(
+                            .skill_completion_followup(
                                 tool_call_count,
                                 skills.is_some(),
                                 NudgeContext {
@@ -2532,6 +3194,7 @@ impl AgentRuntime {
                                     system: &system,
                                     model: "",
                                     max_tokens: self.max_tokens.unwrap_or(4096),
+                                    skills_content: skills.as_deref(),
                                 },
                                 session_id,
                             )
@@ -2579,16 +3242,9 @@ impl AgentRuntime {
                                 heartbeat_depth: 0,
                                 allowed_tools: self.session_allowed_tools(session_id),
                             };
-                            let output = match self.check_tool_allowed(session_id, name) {
-                                Err(e) => ToolOutput::error(e.to_string()),
-                                Ok(()) => match self.find_tool(name) {
-                                    Some(tool) => tool
-                                        .execute(&context, input.clone())
-                                        .await
-                                        .unwrap_or_else(|e| ToolOutput::error(e.to_string())),
-                                    None => ToolOutput::error(format!("unknown tool: {}", name)),
-                                },
-                            };
+                            let output = self
+                                .run_tool(session_id, traj_turn_index, &context, name, input)
+                                .await;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
                                 content: output.content,
@@ -2728,14 +3384,22 @@ impl AgentRuntime {
         const THRESHOLD: f64 = 0.42;
         const TOP_K: usize = 3;
 
-        let query_embedding = self.embed_query(user_text).await;
+        // When memory_text contains a group-context header (LINE group RAG injects
+        // "[Recent group context]\n...\n---\n<current message>"), use only the
+        // current message as the search query so the long history doesn't dilute
+        // keyword/vector matching against document chunks.
+        let query = match user_text.rfind("\n---\n") {
+            Some(pos) => user_text[pos + 5..].trim(),
+            None => user_text.trim(),
+        };
+
+        let query_embedding = self.embed_query(query).await;
         if query_embedding.is_none() {
-            warn!("auto_rag: no embedding provider, skipping");
-            return None;
+            info!("auto_rag: no embedding provider, falling back to keyword search");
         }
 
         let chunks = store
-            .hybrid_search_chunks(user_text, query_embedding.as_deref(), TOP_K, THRESHOLD)
+            .hybrid_search_chunks(query, query_embedding.as_deref(), TOP_K, THRESHOLD)
             .unwrap_or_default();
 
         info!("auto_rag: found {} chunks above threshold", chunks.len());
@@ -2762,6 +3426,69 @@ impl AgentRuntime {
         }
         parts.push("=== END DOCUMENT CONTEXT ===".to_string());
         Some(parts.join("\n\n"))
+    }
+
+    /// Answer `question` from `context_block` with a single, tool-free LLM call.
+    ///
+    /// Used by the group-chat RAG layer so that retrieved chat history is
+    /// reported as-is, without the agent invoking file/bash tools to "verify"
+    /// paths or other information that already exists in the context.
+    pub async fn synthesize_from_context(
+        &self,
+        session_id: &str,
+        context_block: &str,
+        question: &str,
+        history: &[ChatMessage],
+    ) -> Result<String> {
+        let provider = self
+            .default_provider()
+            .ok_or_else(|| Error::Agent("no LLM provider configured".into()))?;
+
+        let system = Some(
+            "You extract and report information from a provided group-chat context block. \
+             Answer the user's question using ONLY what is written in [Group chat context]. \
+             Do NOT check files, verify paths, run commands, or call any tools. \
+             The context is the ground truth — report it directly."
+                .to_string(),
+        );
+
+        let user_content = format!("[Group chat context]\n{context_block}\n\n---\n{question}");
+
+        let mut messages: Vec<ChatMessage> = history.to_vec();
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: MessagePart::Text(user_content),
+        });
+
+        let request = LlmRequest {
+            model: String::new(),
+            messages,
+            system,
+            max_tokens: Some(self.max_tokens.unwrap_or(4096)),
+            temperature: None,
+            tools: vec![], // structurally no tools — prevents FileRead/Bash from firing
+        };
+
+        let response = provider.complete(&request).await?;
+
+        if let Some(usage) = &response.usage {
+            self.accumulate_usage(
+                session_id,
+                provider.provider_id(),
+                &response.model,
+                usage.input_tokens,
+                usage.output_tokens,
+            );
+        }
+
+        let text = extract_text(&response.content);
+        if text.is_empty() {
+            return Err(Error::Agent(
+                "empty response from LLM during context synthesis".into(),
+            ));
+        }
+
+        Ok(text)
     }
 }
 
@@ -2953,7 +3680,11 @@ fn self_learning_guidance() -> String {
      3. Does a similar skill already exist? (if yes → skip)\n\n\
      If yes to (1) and (2) and no to (3): **ask the user for confirmation before saving** \
      (e.g. 'I found a reusable workflow — would you like me to save it as a skill?'). \
-     Only call `create_skill` after the user confirms."
+     Only call `create_skill` after the user confirms.\n\n\
+     **Improving existing skills (action='patch'):**\n\
+     If you retrieved an existing skill and noticed gaps — steps that were unclear, \
+     outdated, or missing — you may call `create_skill` with `action='patch'` to \
+     improve it autonomously. No user confirmation is required for patches."
         .to_string()
 }
 
@@ -3069,8 +3800,10 @@ fn inject_rag_into_content(user_content: MessagePart, rag_context: Option<&str>)
         MessagePart::Text(text) => MessagePart::Text(format!(
             "{rag}\n\n\
              [Answer the question below using the document context above as your primary source. \
-             If the document context does not cover the question, fall back to memory or general knowledge \
-             and say so briefly.]\n\n\
+             If the context above seems incomplete or does not fully cover the question, \
+             call the doc_search tool to retrieve additional chunks before answering. \
+             If the document context does not cover the question at all, fall back to memory \
+             or general knowledge and say so briefly.]\n\n\
              ---\n\n\
              {text}"
         )),
@@ -3141,6 +3874,64 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 
 /// Compact text representation of a skill used for embedding at index time.
 /// Combines name, description, and triggers so the vector captures intent.
+/// Parsed result of the refine-nudge confidence assessment round.
+struct RefineAssessment {
+    should_patch: bool,
+    confidence: f64,
+}
+
+/// Parse the JSON assessment produced by the confidence-check LLM call.
+/// Returns a conservative default (should_patch=false) on any parse error.
+fn parse_refine_assessment(text: &str) -> RefineAssessment {
+    // Strip markdown code fences if present.
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
+        let should_patch = v
+            .get("should_patch")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let confidence = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
+        return RefineAssessment {
+            should_patch,
+            confidence,
+        };
+    }
+    RefineAssessment {
+        should_patch: false,
+        confidence: 0.0,
+    }
+}
+
+/// Extract skill names from the injected `# Active Skills` block and read
+/// their CHANGELOG.md files. Returns a formatted string for the refine prompt,
+/// or an empty string if no changelogs are found.
+fn build_changelog_context(skills_block: &str, skills_dir: &std::path::Path) -> String {
+    // Skill names appear as "## skill-name" headings in the block.
+    let names: Vec<&str> = skills_block
+        .lines()
+        .filter_map(|l| l.strip_prefix("## "))
+        .collect();
+    let mut out = String::new();
+    for name in names {
+        let changelog = skills_dir.join(name).join("CHANGELOG.md");
+        if let Ok(content) = std::fs::read_to_string(&changelog) {
+            // Include only the first 500 chars to keep prompt compact.
+            let snippet = if content.len() > 500 {
+                &content[..500]
+            } else {
+                &content
+            };
+            out.push_str(&format!("### {name}\n{snippet}\n\n"));
+        }
+    }
+    out
+}
+
 fn skill_embed_text(skill: &opencrust_skills::SkillDefinition) -> String {
     let fm = &skill.frontmatter;
     let mut parts = vec![fm.name.clone(), fm.description.clone()];
@@ -3179,6 +3970,70 @@ fn skill_prompt_block_refs(skills: &[&opencrust_skills::SkillDefinition]) -> Str
         block.push('\n');
     }
     block
+}
+
+/// Parse the JSON response from the LLM trajectory compressor into a `TrajectorySummary`.
+/// Falls back to sensible defaults when the response is malformed.
+fn parse_compression_response(
+    text: &str,
+    session_id: &str,
+    source_turn_count: usize,
+) -> TrajectorySummary {
+    // Strip optional markdown code fences.
+    let json_str = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let v: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
+
+    let tool_pattern: Vec<String> = v
+        .get("tool_pattern")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let confidence = v
+        .get("confidence")
+        .and_then(|c| c.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+
+    let candidate_skill = v
+        .get("candidate_skill")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty() && *s != "null")
+        .map(str::to_string);
+
+    TrajectorySummary {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        summary_text: v
+            .get("summary_text")
+            .and_then(|s| s.as_str())
+            .unwrap_or("(no summary)")
+            .to_string(),
+        candidate_skill: if confidence >= 0.6 {
+            candidate_skill
+        } else {
+            None
+        },
+        tool_pattern,
+        confidence,
+        user_intent: v
+            .get("user_intent")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(str::to_string),
+        source_turn_count,
+        compressed_at: chrono::Utc::now().timestamp(),
+    }
 }
 
 #[cfg(test)]
@@ -3575,6 +4430,26 @@ mod tests {
     }
 
     #[test]
+    fn set_session_tool_config_preserves_call_count_across_messages() {
+        // Regression test for issue #318: call_count must not reset when
+        // set_session_tool_config is called again (as happens on every message).
+        let runtime = AgentRuntime::new();
+
+        // First message: configure budget of 3, use 2 calls
+        runtime.set_session_tool_config("sess", None, Some(3));
+        assert!(runtime.check_tool_allowed("sess", "bash").is_ok()); // call 1
+        assert!(runtime.check_tool_allowed("sess", "bash").is_ok()); // call 2
+
+        // Second message: set_session_tool_config is called again (simulating
+        // a new incoming message). call_count must still be 2, not reset to 0.
+        runtime.set_session_tool_config("sess", None, Some(3));
+        assert!(runtime.check_tool_allowed("sess", "bash").is_ok()); // call 3
+        let err = runtime.check_tool_allowed("sess", "bash"); // call 4 → blocked
+        assert!(err.is_err(), "budget should be exhausted across messages");
+        assert!(err.unwrap_err().to_string().contains("budget"));
+    }
+
+    #[test]
     fn retain_session_tool_configs_removes_evicted_sessions() {
         let runtime = AgentRuntime::new();
         runtime.set_session_tool_config("keep", Some(vec!["bash".to_string()]), None);
@@ -3583,6 +4458,26 @@ mod tests {
         assert!(runtime.check_tool_allowed("keep", "bash").is_ok());
         // "drop" has no config → passes through (None config = all allowed)
         assert!(runtime.check_tool_allowed("drop", "bash").is_ok());
+    }
+
+    #[test]
+    fn retain_session_dna_overrides_removes_evicted_sessions() {
+        let runtime = AgentRuntime::new();
+        runtime.set_session_dna_override("keep", Some("you are helpful".to_string()));
+        runtime.set_session_dna_override("drop", Some("you are a pirate".to_string()));
+        runtime.retain_session_dna_overrides(|id| id == "keep");
+        assert!(runtime.session_dna_override.contains_key("keep"));
+        assert!(!runtime.session_dna_override.contains_key("drop"));
+    }
+
+    #[test]
+    fn retain_session_skills_overrides_removes_evicted_sessions() {
+        let runtime = AgentRuntime::new();
+        runtime.set_session_skills_override("keep", Some("skill: greet".to_string()));
+        runtime.set_session_skills_override("drop", Some("skill: farewell".to_string()));
+        runtime.retain_session_skills_overrides(|id| id == "keep");
+        assert!(runtime.session_skills_override.contains_key("keep"));
+        assert!(!runtime.session_skills_override.contains_key("drop"));
     }
 
     #[test]
@@ -3641,16 +4536,18 @@ mod tests {
         // Embed the chunk as a 3-dim unit vector pointing toward [1, 0, 0].
         let resume_embedding: Vec<f32> = vec![1.0, 0.0, 0.0];
         store
-            .add_chunk(
+            .add_chunks_batch(
                 &doc_id,
-                0,
-                "John Doe — Senior Rust Engineer with 10 years of experience.",
-                Some(&resume_embedding),
-                Some("fixed"),
-                Some(3),
-                None,
+                &[opencrust_db::NewDocumentChunk {
+                    chunk_index: 0,
+                    text: "John Doe — Senior Rust Engineer with 10 years of experience.",
+                    embedding: Some(&resume_embedding),
+                    model: Some("fixed"),
+                    dims: Some(3),
+                    token_count: None,
+                }],
             )
-            .expect("add chunk");
+            .expect("add chunks batch");
 
         store
     }
@@ -3700,6 +4597,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_rag_keyword_fallback_when_no_embedding_provider() {
+        // No embedding provider set — should fall back to keyword search.
+        let store = Arc::new(resume_store());
+        let mut runtime = AgentRuntime::new();
+        runtime.doc_store = Some(store);
+        // Deliberately no embedding provider.
+
+        // Query contains "Rust" and "Engineer" which appear in the chunk text.
+        let ctx = runtime.auto_rag_context("Rust Engineer experience").await;
+
+        assert!(
+            ctx.is_some(),
+            "keyword fallback should inject context when query terms match chunk text"
+        );
+        let ctx = ctx.unwrap();
+        assert!(
+            ctx.contains("resume.pdf"),
+            "context should name the source document"
+        );
+        assert!(
+            ctx.contains("Senior Rust Engineer"),
+            "context should include chunk text"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_rag_keyword_fallback_returns_none_when_no_terms_match() {
+        let store = Arc::new(resume_store());
+        let mut runtime = AgentRuntime::new();
+        runtime.doc_store = Some(store);
+
+        // Query has no terms present in the chunk.
+        let ctx = runtime.auto_rag_context("weather Bangkok forecast").await;
+
+        assert!(
+            ctx.is_none(),
+            "keyword fallback should return None when no terms match"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_rag_returns_none_for_unrelated_question() {
         let store = Arc::new(resume_store());
 
@@ -3734,6 +4672,10 @@ mod tests {
                 rationale: None,
                 triggers: triggers.into_iter().map(|t| t.to_string()).collect(),
                 dependencies: Vec::new(),
+                version: None,
+                license: None,
+                compatibility: None,
+                metadata: None,
             },
             body: format!("Steps for {}", name),
             source_path: None,
@@ -4221,6 +5163,100 @@ mod tests {
         }
     }
 
+    /// Provider for refine-nudge tests: accepts tool definitions, returns a text reply.
+    struct RefineTextProvider {
+        reply: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for RefineTextProvider {
+        fn provider_id(&self) -> &str {
+            "refine-text"
+        }
+        async fn complete(&self, _request: &LlmRequest) -> Result<crate::providers::LlmResponse> {
+            Ok(crate::providers::LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.reply.to_string(),
+                }],
+                model: String::new(),
+                usage: None,
+                stop_reason: None,
+            })
+        }
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Provider that simulates the two-round refine nudge flow:
+    /// - Round 1 (tools=[]): returns a high-confidence JSON assessment
+    /// - Round 2 (tools=[create_skill]): returns a patch tool_use call
+    struct RefinePatchProvider {
+        skill_name: &'static str,
+        new_body: &'static str,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+    impl RefinePatchProvider {
+        fn new(skill_name: &'static str, new_body: &'static str) -> Self {
+            Self {
+                skill_name,
+                new_body,
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for RefinePatchProvider {
+        fn provider_id(&self) -> &str {
+            "refine-patch"
+        }
+        async fn complete(&self, request: &LlmRequest) -> Result<crate::providers::LlmResponse> {
+            let round = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == 0 {
+                // Round 1: assessment — no tools expected
+                assert!(
+                    request.tools.is_empty(),
+                    "assessment round must send tools=[]"
+                );
+                let json = format!(
+                    r#"{{"should_patch":true,"confidence":0.9,"reason":"step 2 was unclear","skill_name":"{}"}}"#,
+                    self.skill_name
+                );
+                Ok(crate::providers::LlmResponse {
+                    content: vec![ContentBlock::Text { text: json }],
+                    model: String::new(),
+                    usage: None,
+                    stop_reason: None,
+                })
+            } else {
+                // Round 2: patch execution — create_skill tool expected
+                assert!(
+                    request.tools.iter().any(|t| t.name == "create_skill"),
+                    "patch round must send create_skill tool definition"
+                );
+                Ok(crate::providers::LlmResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "tu_1".to_string(),
+                        name: "create_skill".to_string(),
+                        input: serde_json::json!({
+                            "action": "patch",
+                            "name": self.skill_name,
+                            "body": self.new_body,
+                            "reason": "step 2 was unclear",
+                        }),
+                    }],
+                    model: String::new(),
+                    usage: None,
+                    stop_reason: None,
+                })
+            }
+        }
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
     struct FailingProvider;
     #[async_trait::async_trait]
     impl LlmProvider for FailingProvider {
@@ -4252,7 +5288,7 @@ mod tests {
         };
         // tool_call_count = 2, threshold = 3 → should not fire
         let result = runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD - 1,
                 false,
                 NudgeContext {
@@ -4261,6 +5297,7 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 256,
+                    skills_content: None,
                 },
                 "sess",
             )
@@ -4269,15 +5306,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nudge_returns_none_when_skills_were_injected() {
-        // If a skill was injected the agent is executing from it — don't ask to save again.
+    async fn nudge_returns_none_when_skills_injected_and_no_patch_needed() {
+        // When a skill was injected but the refine nudge determines no patch is needed
+        // (model replies with text, no tool_use), the followup should return None.
         let dir = tempfile::TempDir::new().unwrap();
         let runtime = runtime_with_create_skill_tool(dir.path());
-        let provider = FixedProvider {
-            reply: "Would you like to save this?",
-        };
+        let provider = RefineTextProvider { reply: "" };
         let result = runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD,
                 true,
                 NudgeContext {
@@ -4286,13 +5322,14 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 256,
+                    skills_content: None,
                 },
                 "sess",
             )
             .await;
         assert!(
             result.is_none(),
-            "should not fire when skills were already injected"
+            "should return None when model signals no improvement needed"
         );
     }
 
@@ -4303,7 +5340,7 @@ mod tests {
             reply: "Would you like to save this?",
         };
         let result = runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD + 5,
                 false,
                 NudgeContext {
@@ -4312,6 +5349,7 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 256,
+                    skills_content: None,
                 },
                 "sess",
             )
@@ -4330,7 +5368,7 @@ mod tests {
             reply: "Would you like to save this workflow as a reusable skill?",
         };
         let result = runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD,
                 false,
                 NudgeContext {
@@ -4339,6 +5377,7 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 256,
+                    skills_content: None,
                 },
                 "sess",
             )
@@ -4383,7 +5422,7 @@ mod tests {
         let provider = CheckMaxTokensProvider;
         // Pass a very large max_tokens; method must clamp to 256
         let result = runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD,
                 false,
                 NudgeContext {
@@ -4392,6 +5431,7 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 8192,
+                    skills_content: None,
                 },
                 "sess",
             )
@@ -4405,7 +5445,7 @@ mod tests {
         let runtime = runtime_with_create_skill_tool(dir.path());
         let provider = FailingProvider;
         let result = runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD,
                 false,
                 NudgeContext {
@@ -4414,6 +5454,7 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 256,
+                    skills_content: None,
                 },
                 "sess",
             )
@@ -4463,7 +5504,7 @@ mod tests {
 
         let history = vec![make_msg(ChatRole::User, "help me rebase")];
         runtime
-            .skill_nudge_followup(
+            .skill_completion_followup(
                 SKILL_REFLECTION_THRESHOLD,
                 false,
                 NudgeContext {
@@ -4472,6 +5513,7 @@ mod tests {
                     system: &None,
                     model: "",
                     max_tokens: 256,
+                    skills_content: None,
                 },
                 "sess",
             )
@@ -4494,5 +5536,253 @@ mod tests {
             "injected message must contain [internal] marker"
         );
         assert!(matches!(last.role, ChatRole::User));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // skill_refine_nudge_followup unit tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn refine_nudge_returns_none_below_threshold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime = runtime_with_create_skill_tool(dir.path());
+        let provider = RefineTextProvider { reply: "" };
+        let result = runtime
+            .skill_refine_nudge_followup(
+                SKILL_REFLECTION_THRESHOLD - 1,
+                NudgeContext {
+                    provider: &provider,
+                    messages: &[],
+                    system: &None,
+                    model: "",
+                    max_tokens: 256,
+                    skills_content: None,
+                },
+                "sess",
+            )
+            .await;
+        assert!(
+            result.is_none(),
+            "refine nudge must not fire below threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn refine_nudge_returns_none_without_create_skill_tool() {
+        let runtime = AgentRuntime::new();
+        let provider = RefineTextProvider { reply: "" };
+        let result = runtime
+            .skill_refine_nudge_followup(
+                SKILL_REFLECTION_THRESHOLD,
+                NudgeContext {
+                    provider: &provider,
+                    messages: &[],
+                    system: &None,
+                    model: "",
+                    max_tokens: 256,
+                    skills_content: None,
+                },
+                "sess",
+            )
+            .await;
+        assert!(
+            result.is_none(),
+            "refine nudge must not fire when create_skill is not registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn refine_nudge_returns_none_when_model_says_no_improvement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime = runtime_with_create_skill_tool(dir.path());
+        let provider = RefineTextProvider { reply: "" };
+        let result = runtime
+            .skill_refine_nudge_followup(
+                SKILL_REFLECTION_THRESHOLD,
+                NudgeContext {
+                    provider: &provider,
+                    messages: &[],
+                    system: &None,
+                    model: "",
+                    max_tokens: 256,
+                    skills_content: None,
+                },
+                "sess",
+            )
+            .await;
+        assert!(
+            result.is_none(),
+            "empty model reply means no improvement needed — should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn refine_nudge_applies_patch_and_returns_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-create the skill so patch can find it.
+        let skill_dir = dir.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: test\n---\nOriginal body with enough chars to pass validation and be valid.",
+        )
+        .unwrap();
+
+        let runtime = runtime_with_create_skill_tool(dir.path());
+        let provider = RefinePatchProvider::new(
+            "my-skill",
+            "Updated body with improvements and enough characters to pass validation.",
+        );
+        let result = runtime
+            .skill_refine_nudge_followup(
+                SKILL_REFLECTION_THRESHOLD,
+                NudgeContext {
+                    provider: &provider,
+                    messages: &[],
+                    system: &None,
+                    model: "",
+                    max_tokens: 512,
+                    skills_content: None,
+                },
+                "sess",
+            )
+            .await;
+        assert!(
+            result.is_some(),
+            "should return a note when patch was applied"
+        );
+        assert!(
+            result.unwrap().contains("my-skill"),
+            "note should mention the skill name"
+        );
+        // Verify the skill file was updated.
+        let updated = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(
+            updated.contains("Updated body"),
+            "SKILL.md should reflect the patch"
+        );
+        // CHANGELOG.md should be written inside the skill folder.
+        let changelog = std::fs::read_to_string(skill_dir.join("CHANGELOG.md")).unwrap();
+        assert!(
+            changelog.contains("step 2 was unclear"),
+            "CHANGELOG should record patch reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn refine_nudge_skips_patch_when_confidence_too_low() {
+        /// Provider that returns a low-confidence assessment on round 1.
+        struct LowConfidenceProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for LowConfidenceProvider {
+            fn provider_id(&self) -> &str {
+                "low-conf"
+            }
+            async fn complete(
+                &self,
+                _request: &LlmRequest,
+            ) -> Result<crate::providers::LlmResponse> {
+                Ok(crate::providers::LlmResponse {
+                    content: vec![ContentBlock::Text {
+                        text: r#"{"should_patch":true,"confidence":0.5,"reason":"minor gap","skill_name":"x"}"#.to_string(),
+                    }],
+                    model: String::new(),
+                    usage: None,
+                    stop_reason: None,
+                })
+            }
+            async fn health_check(&self) -> Result<bool> {
+                Ok(true)
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime = runtime_with_create_skill_tool(dir.path());
+        let provider = LowConfidenceProvider;
+        let result = runtime
+            .skill_refine_nudge_followup(
+                SKILL_REFLECTION_THRESHOLD,
+                NudgeContext {
+                    provider: &provider,
+                    messages: &[],
+                    system: &None,
+                    model: "",
+                    max_tokens: 512,
+                    skills_content: None,
+                },
+                "sess",
+            )
+            .await;
+        assert!(
+            result.is_none(),
+            "should not patch when confidence < SKILL_REFINE_CONFIDENCE_THRESHOLD"
+        );
+    }
+
+    #[test]
+    fn parse_refine_assessment_valid_json() {
+        let text = r#"{"should_patch":true,"confidence":0.85,"reason":"gap","skill_name":"x"}"#;
+        let a = parse_refine_assessment(text);
+        assert!(a.should_patch);
+        assert!((a.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_refine_assessment_with_code_fence() {
+        let text = "```json\n{\"should_patch\":false,\"confidence\":0.3,\"reason\":\"ok\"}\n```";
+        let a = parse_refine_assessment(text);
+        assert!(!a.should_patch);
+    }
+
+    #[test]
+    fn parse_refine_assessment_invalid_returns_no_patch() {
+        let a = parse_refine_assessment("not json at all");
+        assert!(!a.should_patch);
+        assert_eq!(a.confidence, 0.0);
+    }
+
+    #[test]
+    fn parse_compression_response_valid_json() {
+        let raw = r#"{"summary_text":"Agent searched and summarised","candidate_skill":"web-research","tool_pattern":["web_search","summarize"],"confidence":0.85,"user_intent":"research"}"#;
+        let s = parse_compression_response(raw, "s1", 3);
+        assert_eq!(s.session_id, "s1");
+        assert_eq!(s.source_turn_count, 3);
+        assert_eq!(s.candidate_skill.as_deref(), Some("web-research"));
+        assert!((s.confidence - 0.85).abs() < 0.001);
+        assert_eq!(s.tool_pattern, vec!["web_search", "summarize"]);
+        assert_eq!(s.user_intent.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn parse_compression_response_with_code_fence() {
+        let raw = "```json\n{\"summary_text\":\"X\",\"confidence\":0.9,\"tool_pattern\":[\"bash\"],\"candidate_skill\":\"shell-helper\",\"user_intent\":null}\n```";
+        let s = parse_compression_response(raw, "s2", 1);
+        assert_eq!(s.candidate_skill.as_deref(), Some("shell-helper"));
+    }
+
+    #[test]
+    fn parse_compression_response_low_confidence_suppresses_candidate() {
+        let raw = r#"{"summary_text":"misc","candidate_skill":"maybe-skill","tool_pattern":[],"confidence":0.4,"user_intent":null}"#;
+        let s = parse_compression_response(raw, "s3", 1);
+        // confidence < 0.6 → candidate_skill should be None
+        assert!(s.candidate_skill.is_none());
+    }
+
+    #[test]
+    fn parse_compression_response_invalid_json_fallback() {
+        let s = parse_compression_response("not json", "s4", 0);
+        assert_eq!(s.summary_text, "(no summary)");
+        assert!(s.candidate_skill.is_none());
+        assert_eq!(s.confidence, 0.0);
+    }
+
+    #[test]
+    fn compress_old_trajectories_returns_zero_without_store() {
+        let rt = AgentRuntime::new();
+        // No trajectory store configured — should return 0 immediately.
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rt.compress_old_trajectories(90));
+        assert_eq!(result, 0);
     }
 }

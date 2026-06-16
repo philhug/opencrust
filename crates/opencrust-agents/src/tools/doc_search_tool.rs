@@ -10,6 +10,24 @@ const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 20;
 const DEFAULT_MIN_SIMILARITY: f64 = 0.3;
 
+/// Returns true when the query looks like a filename (e.g. "CLAUDE.md", "report.pdf").
+/// Requires an extension of 2–10 ASCII alphanumeric chars to avoid false positives
+/// like "version 2.0" (ext "0", length 1) or "3.14 is pi" (ext "14" but prefix is digits).
+fn looks_like_filename(query: &str) -> bool {
+    let trimmed = query.trim();
+    if let Some(dot_pos) = trimmed.rfind('.') {
+        let ext = &trimmed[dot_pos + 1..];
+        let prefix = trimmed[..dot_pos].trim();
+        ext.len() >= 2
+            && ext.len() <= 10
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && !prefix.is_empty()
+            && !prefix.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
 /// Async embedding function type.
 pub type EmbedFn =
     Arc<dyn Fn(&str) -> futures::future::BoxFuture<'_, Result<Vec<f32>>> + Send + Sync>;
@@ -43,7 +61,13 @@ impl Tool for DocSearchTool {
 
     fn system_hint(&self) -> Option<&str> {
         Some(
-            "Use this FIRST for any question about documents, data, regulations, properties, or reference material the user has shared. Do NOT use file_read for this.",
+            "Use this FIRST for any question about documents, data, regulations, properties, \
+             or reference material the user has shared. Also use when the user asks about a \
+             specific file by name (e.g. 'what is in CLAUDE.md?') — pass the filename as the \
+             query and the tool will find it by name if semantic search returns nothing. \
+             If document context was already provided above but seems incomplete or does not \
+             fully answer the question, call this tool with a more specific query to retrieve \
+             additional chunks. Do NOT use file_read for ingested documents.",
         )
     }
 
@@ -93,7 +117,7 @@ impl Tool for DocSearchTool {
             None
         };
 
-        let chunks = store
+        let mut chunks = store
             .hybrid_search_chunks(
                 query,
                 query_embedding.as_deref(),
@@ -101,6 +125,39 @@ impl Tool for DocSearchTool {
                 DEFAULT_MIN_SIMILARITY,
             )
             .map_err(|e| Error::Agent(format!("document search failed: {e}")))?;
+
+        // Filename fallback: when the query looks like a filename, or when semantic/keyword
+        // search returned nothing, also look up documents by name directly so the user can
+        // ask "what is in CLAUDE.md?" and get an answer even if the content isn't semantically
+        // close to the filename string.
+        if chunks.is_empty() || looks_like_filename(query) {
+            let matched_docs = match store
+                .get_document_by_name(query)
+                .map_err(|e| Error::Agent(format!("name lookup failed: {e}")))?
+            {
+                Some(doc) => vec![doc],
+                None => store
+                    .search_documents_by_name(query)
+                    .map_err(|e| Error::Agent(format!("name search failed: {e}")))?,
+            };
+
+            let existing_ids: std::collections::HashSet<String> =
+                chunks.iter().map(|c| c.id.clone()).collect();
+
+            'outer: for doc in matched_docs {
+                let doc_chunks = store
+                    .get_chunks_by_document_id(&doc.id)
+                    .map_err(|e| Error::Agent(format!("chunk fetch failed: {e}")))?;
+                for chunk in doc_chunks {
+                    if !existing_ids.contains(&chunk.id) {
+                        chunks.push(chunk);
+                        if chunks.len() >= limit {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
 
         if chunks.is_empty() {
             return Ok(ToolOutput::success(
@@ -168,5 +225,57 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("No relevant document content"));
+    }
+
+    #[test]
+    fn looks_like_filename_detection() {
+        assert!(looks_like_filename("CLAUDE.md"));
+        assert!(looks_like_filename("report.pdf"));
+        assert!(looks_like_filename("data.json"));
+        assert!(looks_like_filename("  CLAUDE.md  "));
+        assert!(!looks_like_filename("what is in the document"));
+        assert!(!looks_like_filename("3.14 is pi"));
+        assert!(!looks_like_filename("version 2.0"));
+        assert!(!looks_like_filename("no extension here"));
+        assert!(!looks_like_filename(".hidden"));
+    }
+
+    #[test]
+    fn finds_document_by_filename_when_semantic_returns_empty() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let store = DocumentStore::open(tmp.path()).unwrap();
+            let doc_id = store
+                .add_document("CLAUDE.md", Some("/tmp/CLAUDE.md"), "text/markdown")
+                .unwrap();
+            store
+                .add_chunks_batch(
+                    &doc_id,
+                    &[opencrust_db::NewDocumentChunk {
+                        chunk_index: 0,
+                        text: "This is the CLAUDE.md content",
+                        embedding: None,
+                        model: None,
+                        dims: None,
+                        token_count: None,
+                    }],
+                )
+                .unwrap();
+        }
+
+        let tool = make_tool_with_path(tmp.path().to_path_buf());
+        let ctx = ToolContext {
+            session_id: "test".into(),
+            user_id: None,
+            heartbeat_depth: 0,
+            allowed_tools: None,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let output = rt
+            .block_on(tool.execute(&ctx, serde_json::json!({"query": "CLAUDE.md"})))
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("CLAUDE.md"));
+        assert!(output.content.contains("CLAUDE.md content"));
     }
 }

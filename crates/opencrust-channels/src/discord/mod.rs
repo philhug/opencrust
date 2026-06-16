@@ -73,6 +73,9 @@ pub struct DiscordChannel {
     /// Discord-specific configuration.
     config: DiscordConfig,
 
+    /// Config key name (e.g. `"discord-support"`).
+    name: String,
+
     /// Current connection status.
     status: ChannelStatus,
 
@@ -118,6 +121,7 @@ impl DiscordChannel {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             config,
+            name: "discord".to_string(),
             status: ChannelStatus::Disconnected,
             on_message,
             group_filter,
@@ -126,6 +130,12 @@ impl DiscordChannel {
             client_handle: None,
             shard_manager: None,
         }
+    }
+
+    /// Override the config key name for this channel instance.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
     }
 
     /// Create a `DiscordChannel` from the generic `ChannelConfig` settings.
@@ -205,12 +215,17 @@ impl DiscordChannel {
 /// Lightweight send-only handle for Discord. Holds a pre-built `Http` client.
 pub struct DiscordSender {
     http: std::sync::Arc<serenity_model::Http>,
+    name: String,
 }
 
 #[async_trait]
 impl ChannelSender for DiscordSender {
     fn channel_type(&self) -> &str {
         "discord"
+    }
+
+    fn channel_name(&self) -> &str {
+        &self.name
     }
 
     async fn send_message(&self, message: &Message) -> Result<()> {
@@ -227,6 +242,7 @@ impl ChannelLifecycle for DiscordChannel {
     fn create_sender(&self) -> Box<dyn ChannelSender> {
         Box::new(DiscordSender {
             http: std::sync::Arc::new(serenity_model::Http::new(&self.config.bot_token)),
+            name: self.name.clone(),
         })
     }
 
@@ -313,6 +329,10 @@ impl ChannelSender for DiscordChannel {
         "discord"
     }
 
+    fn channel_name(&self) -> &str {
+        &self.name
+    }
+
     async fn send_message(&self, message: &Message) -> Result<()> {
         let http = self
             .http
@@ -380,6 +400,41 @@ mod tests {
             });
         let channel = DiscordChannel::new(test_config(), on_msg);
         assert_eq!(channel.channel_type(), "discord");
+    }
+
+    #[test]
+    fn channel_name_defaults_to_channel_type() {
+        let on_msg: DiscordOnMessageFn =
+            Arc::new(|_ch, _uid, _user, _text, _is_group, _file, _delta_tx| {
+                Box::pin(async { Ok(ChannelResponse::Text("test".to_string())) })
+            });
+        let channel = DiscordChannel::new(test_config(), on_msg);
+        assert_eq!(channel.channel_name(), "discord");
+    }
+
+    #[test]
+    fn with_name_overrides_channel_name() {
+        let on_msg: DiscordOnMessageFn =
+            Arc::new(|_ch, _uid, _user, _text, _is_group, _file, _delta_tx| {
+                Box::pin(async { Ok(ChannelResponse::Text("test".to_string())) })
+            });
+        let channel =
+            DiscordChannel::new(test_config(), on_msg).with_name("discord-support".to_string());
+        assert_eq!(channel.channel_name(), "discord-support");
+        assert_eq!(channel.channel_type(), "discord");
+    }
+
+    #[test]
+    fn sender_channel_name_inherits_from_channel() {
+        let on_msg: DiscordOnMessageFn =
+            Arc::new(|_ch, _uid, _user, _text, _is_group, _file, _delta_tx| {
+                Box::pin(async { Ok(ChannelResponse::Text("test".to_string())) })
+            });
+        let channel =
+            DiscordChannel::new(test_config(), on_msg).with_name("discord-eng".to_string());
+        let sender = channel.create_sender();
+        assert_eq!(sender.channel_name(), "discord-eng");
+        assert_eq!(sender.channel_type(), "discord");
     }
 
     #[test]
